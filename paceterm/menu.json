@@ -1,0 +1,29 @@
+{
+  "menus": [
+    {
+      "title": "파일(F)",
+      "items": [
+        {"name": "끝내기(X)", "action": "exit_app"}
+      ]
+    },
+    {
+      "title": "포트(P)",
+      "items": [
+        {"name": "포트 연결(O)", "action": "open_port"},
+        {"name": "포트 끊기(D)", "action": "close_port"}
+      ]
+    },
+    {
+      "title": "보기(V)",
+      "items": [
+        {"name": "그래프 보기(G)", "action": "toggle_plot"}
+      ]
+    },
+    {
+      "title": "도움말(H)",
+      "items": [
+        {"name": "단축키 안내", "action": "show_help"}
+      ]
+    }
+  ]
+}

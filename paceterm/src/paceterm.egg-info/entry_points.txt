@@ -1,0 +1,2 @@
+[console_scripts]
+paceterm = paceterm.__main__:main

@@ -1,0 +1,14 @@
+[project]
+name = "paceterm"
+version = "0.1.0"
+description = "Firmware serial terminal"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pygame-ce",
+    "pyserial",
+    "numpy"
+]
+
+[project.scripts]
+paceterm = "paceterm.__main__:main"
