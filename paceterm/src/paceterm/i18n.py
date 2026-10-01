@@ -22,7 +22,7 @@ _language: str | None = None
 def _catalog(lang: str) -> dict[str, str]:
     if lang not in _catalogs:
         try:
-            text = (resources.files("baram_term") / "locales" / f"{lang}.json").read_text(encoding="utf-8")
+            text = (resources.files("paceterm") / "locales" / f"{lang}.json").read_text(encoding="utf-8")
             _catalogs[lang] = json.loads(text)
         except FileNotFoundError:
             _catalogs[lang] = {}

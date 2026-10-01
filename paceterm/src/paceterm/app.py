@@ -1,152 +1,2086 @@
-from retroui import App, Terminal, VBox, HBox, Label, MenuBar, Menu, MenuItem, ComboBox, Button, Dialog
-from paceterm.serial_port import SerialPort
+"""baram-term main window."""
+
+from __future__ import annotations
+
+import codecs
+import re
+import threading
+import time
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable
+
+from retroui import (
+    App,
+    Button,
+    CheckBox,
+    ComboBox,
+    EditableComboBox,
+    Dialog,
+    FileDialog,
+    GroupBox,
+    HSplit,
+    HexView,
+    HBox,
+    Label,
+    LineEdit,
+    Link,
+    ListPopup,
+    ListView,
+    TabBar,
+    TextArea,
+    LivePlot,
+    PlotLegend,
+    VSplit,
+    Menu,
+    MenuBar,
+    MenuItem,
+    Mod,
+    Spacer,
+    Terminal,
+    VBox,
+    message_box,
+)
+from retroui.core.wcwidth import str_width
+from retroui.widgets.lineedit import clipboard_put
+from retroui.input.events import IS_MAC, Key, KeyEvent
+
+from paceterm import __version__
+from paceterm.completion import Completer, at_prompt
+from paceterm.control import ControlServer, CtlError, RxHistory
+from paceterm.outgoing import outgoing_bytes
+from paceterm.hexinfo import as_hex, describe
+from paceterm.highlight import default_rules
+from paceterm.rules import COLORS, DEFAULT_COLOR, RulePreview, compile_rules, entry_label, format_entry, parse_entry, pattern_error
+from paceterm.icon import make_icon
+from paceterm.i18n import language, tr
+from paceterm.logger import LineCleaner, SessionLog, default_log_dir, log_filename
+from paceterm.plotdata import parse_line, plot_format
+from paceterm.plotfilter import PlotLineFilter
+from paceterm.logo import banner
+from paceterm import notes as notes_store
+from paceterm.notes import MAX_NOTES, Note
+from paceterm.macros import SLOTS as MACRO_SLOTS, MacroBar, free_keys, join_entry, split_entry
+from paceterm.search import SearchBar
+from paceterm.serial_port import DEMO_PORT, PortSettings, SerialPort, list_ports, open_device, usb_info
+from paceterm import settings as config_store
+from paceterm.settings import Settings
+
+BAUD_RATES = ("9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1000000", "2000000")
+BYTESIZES = ("8", "7", "6", "5")
+PARITIES = ("N", "E", "O", "M", "S")
+STOPBITS = ("1", "1.5", "2")
+FLOWS = ("none", "rtscts", "xonxoff")
+ENTER_CODES = {"cr": b"\r", "lf": b"\n", "crlf": b"\r\n"}
+BACKSPACE_CODES = {"bs": b"\x08", "del": b"\x7f"}
+RX_LF_MODES = ("crlf", "lf")
+REPO_URL = "https://github.com/"
+# 언어 이름은 각 언어로 적는다: 화면이 어느 언어여도 자기 언어를 찾을 수 있게
+LANGUAGE_NAMES = {"ko": "한국어", "en": "English"}
+
+
+def _baud_text_ok(text: str) -> bool:
+    """속도 입력칸: 숫자만 (지우는 중인 빈 칸은 허용)."""
+    return text == "" or (text.isdigit() and len(text) <= 8)
+
+
+def _parse_baud(text: str) -> int | None:
+    text = text.strip()
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+PLOT_WINDOWS = ("1", "5", "10", "30", "60", "300")
+NOTE_DELAYS = ("0", "20", "50", "100", "200", "500")
+NOTE_WAIT_PREFIX = "#wait"
+NOTE_PROMPT_TIMEOUT_S = 2.0
+PLOT_WINDOW_MAX_S = 3600.0
+
+
+def _seconds_text_ok(text: str) -> bool:
+    return re.fullmatch(r"\d{0,5}(\.\d{0,3})?", text) is not None
+
+
+def _parse_seconds(text: str) -> float | None:
+    try:
+        value = float(text.strip())
+    except ValueError:
+        return None
+    return value if 0 < value <= PLOT_WINDOW_MAX_S else None
+
+
+def _format_seconds(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+# 복사/붙여넣기 단축키: macOS 는 Cmd, 그 외는 Ctrl+Shift (Ctrl+C/V 는 장치로 보내는 제어 문자라서)
+COPY_KEYS, PASTE_KEYS, SELECT_ALL_KEYS = (
+    ("Primary+C", "Primary+V", "Primary+A") if IS_MAC else ("Ctrl+Shift+C", "Ctrl+Shift+V", "Ctrl+Shift+A")
+)
+# 창 가장자리 여백 (point). 메뉴/테두리/상태줄이 창에 딱 붙으면 답답해 보인다
+WINDOW_PADDING = 8
+# TX/RX 표시등을 켜 두는 시간. 상태줄 갱신 주기(100ms)보다 길어야 짧은 전송도 보인다
+_LED_HOLD_S = 0.15
+_NOT_CONNECTED_NOTICE_S = 2.0
+
+
+def file_dialog_text() -> dict[str, str]:
+    """파일 다이얼로그에서 앱 말로 바꿀 글자 (나머지는 retroui 기본 글자)."""
+    return {"save": tr("button.ok")}
+
+
+def _human_rate(bps: float) -> str:
+    if bps >= 1024 * 1024:
+        return f"{bps / 1024 / 1024:.1f}MB/s"
+    if bps >= 1024:
+        return f"{bps / 1024:.1f}kB/s"
+    return f"{bps:.0f}B/s"
+
 
 class PaceTermApp:
-    def __init__(self):
+    def __init__(
+        self,
+        settings: PortSettings,
+        *,
+        theme: str = "mono",
+        font_size: int = 14,
+        size: tuple[int, int] = (100, 32),
+        headless: bool = False,
+        opener: Callable[[PortSettings], Any] = open_device,
+        config: Settings | None = None,
+        config_path: Path | None = None,
+    ):
+        self.settings = settings
+        # config_path 가 없으면 설정을 파일에 쓰지 않는다 (테스트, 일회성 실행)
+        self.config = config if config is not None else Settings()
+        self.config_path = config_path
+        self._save_error_shown = False
         self.app = App(
-            title="PaceTerm - Firmware CLI", 
-            size=(120, 36), 
-            theme="mono"
+            title="pace-term",
+            size=size,
+            theme=theme,
+            font_size=font_size,
+            headless=headless,
+            padding=WINDOW_PADDING,
+            icon=make_icon(),
         )
-        
-        self.serial_port = SerialPort(on_data_received=self.handle_serial_data)
-        self.baudrate = 115200
-        self.current_port_name = "disconnected"
-
-        file_menu = Menu("파일(F)", [
-            MenuItem("끝내기(X)", self.action_exit)
-        ])
-        
-        port_menu = Menu("포트(P)", [
-            MenuItem("포트 설정(O)...", self.action_open_port_dialog),
-            MenuItem("연결 끊기", self.action_close_port)
-        ])
-        
-        help_menu = Menu("도움말(H)", [
-            MenuItem("도움말 보기", self.action_show_help)
-        ])
-
-        self.menu_bar = MenuBar(menus=[
-            file_menu,
-            port_menu,
-            help_menu
-        ])
-
-        self.terminal = Terminal()
-        self._print_banner()
-
-        self.status_label = Label(" ○ disconnected │ 115200 8N1 │ TX· RX· │ 0B/s ")
-        self.status_bar = HBox(self.status_label)
-
-        self.root_layout = VBox(
-            self.menu_bar,
-            self.terminal,
-            self.status_bar
+        self.port = SerialPort(
+            notify=lambda: self.app.call_soon(self._on_rx),
+            on_error=lambda msg: self.app.call_soon(self._on_port_error, msg),
+            opener=opener,
         )
-        
-        self.app.set_root(self.root_layout)
-        self.active_dialog = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # 외부 제어 (control.py): 받은 글자 기록은 켜고 끄는 것과 상관없이 모은다 (켜자마자 read 가 되게)
+        self.rx_history = RxHistory()
+        self.control: ControlServer | None = None
+        self._released = False  # 외부 제어가 포트를 잠시 놓은 상태 (자동 재연결도 하지 않는다)
+        self.log: SessionLog | None = None
+        self.search: SearchBar | None = None
+        self.last_search = ""
+        self.local_echo = self.config.local_echo
+        self.guard_controls = self.config.guard_controls
+        self.auto_reconnect = self.config.auto_reconnect
+        self._reconnect_timer = None
+        self._prefix = False
+        self._last_not_connected = 0.0
+        self._rate_prev = (time.monotonic(), 0, 0)
+        self._rx_rate = 0.0
 
-    def handle_serial_data(self, data: bytes):
-        try:
-            text = data.decode('utf-8', errors='replace')
-            self.terminal.feed(text)
-        except Exception:
-            pass
-
-    def action_exit(self):
-        self.serial_port.close()
-        self.app.exit()
-
-    def action_open_port_dialog(self):
-        """baram-term 원본 규격에 맞춘 포트 설정 다이얼로그를 엽니다."""
-        if self.active_dialog is not None:
-            return
-
-        ports = SerialPort.list_ports()
-        if not ports:
-            ports = ["No Ports Found"]
-            
-        baudrates = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"]
-
-        self.combo_port = ComboBox(items=ports)
-        self.combo_baud = ComboBox(items=baudrates)
-
-        port_row = HBox(Label("포트: "), self.combo_port)
-        baud_row = HBox(Label("속도: "), self.combo_baud)
-        
-        def on_confirm():
-            selected_port = getattr(self.combo_port, 'current_item', ports[0])
-            selected_baud = getattr(self.combo_baud, 'current_item', "115200")
-            
-            close_my_dialog()
-            if selected_port and selected_port != "No Ports Found":
-                self._connect_to_port(selected_port, int(selected_baud))
-        
-        def on_cancel():
-            close_my_dialog()
-
-        # 다이얼로그 내부에서 사용할 단일 버튼 박스
-        btn_box = HBox(
-            Button(" 확인 ", on_click=on_confirm),
-            Button(" 취소 ", on_click=on_cancel)
+        self.terminal = Terminal(max_lines=5000, scrollbar=True)
+        self._apply_rules()
+        self.terminal.ascii_input = self.config.ascii_input  # set_focus 전에: IME 켜기 여부를 이 값으로 정한다
+        self.terminal.send.connect(self.send)
+        self._apply_line_codes()
+        self.completer = Completer(self)
+        self.completer.enabled = self.config.completion
+        self.completer.on_learned = self._on_commands_learned
+        if self.config.timestamps:
+            self.terminal.set_show_timestamps(True)
+        # 포트 이름은 상태줄에 있어서 테두리 제목은 두지 않는다
+        self.frame = GroupBox("", self.terminal, stretch=2)
+        # 받은 줄의 그래프 값 (>name:value, Arduino 플로터 형식). 가로축은 받은 시각(초), 폭은 plot_window 초
+        self.plot = LivePlot(window=self.config.plot_window, update_hz=30, header=False)
+        self.plot.focusable = False  # 그래프를 눌러도 키보드 입력은 터미널에 남는다
+        # 윗줄: 왼쪽 범례(누르면 보이기/숨기기), 오른쪽 시작/정지 (Arduino IDE 플로터 배치)
+        self.plot_legend = PlotLegend(self.plot)
+        run_w = max(str_width(tr("plot.stop")), str_width(tr("plot.start"))) + 4  # 글자가 바뀌어도 폭 그대로
+        self.plot_run_button = Button(
+            tr("plot.stop"), on_click=self.toggle_plot_pause, style="solid", color="error", min_size=(run_w, 1)
         )
-        
-        # 본문 레이아웃에 포트, 속도, 버튼을 순서대로 배치
-        body_layout = VBox(port_row, baud_row, btn_box)
-        
-        # retroui의 Dialog 위젯 생성 (중복 버튼 생성을 막기 위해 순수 본문만 전달)
-        self.active_dialog = Dialog("포트 설정", body_layout)
+        self.plot_clear_button = Button(tr("plot.clear"), on_click=self.clear_plot, style="solid", color="dim")
+        # 누르는 동안 포커스(►◄ 표시)를 가져가지 않는다: 마우스용 버튼이고 입력은 터미널에 남아야 한다
+        self.plot_run_button.focusable = False
+        self.plot_clear_button.focusable = False
+        plot_toolbar = HBox(self.plot_legend, self.plot_clear_button, self.plot_run_button, spacing=1)
+        # 아랫줄 오른쪽: 시간 폭 (Arduino IDE 플로터에서 설정 칸이 아래 오른쪽에 있는 배치)
+        self.plot_window_combo = EditableComboBox(
+            PLOT_WINDOWS,
+            _format_seconds(self.config.plot_window),
+            validator=_seconds_text_ok,
+            min_size=(8, 1),
+            on_change=self._plot_window_typed,
+            on_submit=self._plot_window_submitted,
+        )
+        self.plot_window_combo.chosen.connect(lambda _text: self.app.set_focus(self.terminal))
+        plot_footer = HBox(
+            Spacer(),
+            Label(tr("plot.window"), fg="dim"),
+            self.plot_window_combo,
+            Label(tr("dialog.plot_window.unit"), fg="dim"),
+            spacing=1,
+        )
+        self.plot_frame = GroupBox("", VBox(plot_toolbar, self.plot, plot_footer), stretch=1, visible=self.config.plot)
+        # HEX 보기: 받은/보낸 바이트 그대로 (터미널 오른쪽). 줄바꿈 코드나 안 보이는 제어 문자를 확인할 때
+        self.hex_view = HexView(max_rows=5000)
+        hex_run_w = max(str_width(tr("hex.stop")), str_width(tr("hex.start"))) + 4
+        self.hex_run_button = Button(
+            tr("hex.stop"), on_click=self.toggle_hex_pause, style="solid", color="error", min_size=(hex_run_w, 1)
+        )
+        self.hex_clear_button = Button(tr("hex.clear"), on_click=self.clear_hex, style="solid", color="dim")
+        self.hex_run_button.focusable = False
+        self.hex_clear_button.focusable = False
+        hex_toolbar = HBox(Spacer(), self.hex_clear_button, self.hex_run_button, spacing=1)
+        # 고른 바이트 설명 줄 (없으면 빈 줄로 둔다: 줄이 생겼다 없어지면 내용이 밀린다)
+        self.hex_info = Label("", fg="dim", stretch=1)  # 남는 폭을 알아야 설명을 그 폭에 맞춘다
+        self.hex_copy_button = Button(tr("hex.copy"), on_click=self.copy_hex_selection, style="solid", color="dim", enabled=False)
+        self.hex_copy_button.focusable = False
+        self.hex_view.selection_changed.connect(self._on_hex_selection)
+        hex_footer = HBox(self.hex_info, self.hex_copy_button, spacing=1)
+        self.hex_page = VBox(hex_toolbar, self.hex_view, hex_footer, stretch=1)
+        # 메모 탭: CLI 에 순서대로 넣을 명령을 적어 둔다 (오른쪽 패널을 HEX 와 탭으로 나눠 쓴다)
+        self.notes_path = (config_path.parent / "notes.json") if config_path is not None else None
+        self.notes: list[Note] = notes_store.load(self.notes_path)[0] if self.notes_path else []
+        self.note_area = TextArea(on_change=lambda _text: self._note_edited())
+        self.note_send_button = Button(tr("note.send_line"), on_click=self.send_note_line, style="solid", color="dim")
+        self.note_all_button = Button(tr("note.send_all"), on_click=self.send_note_block, style="solid", color="ok", min_size=(14, 1))
+        self.note_stop_button = Button(tr("note.stop"), on_click=self.stop_note_send, style="solid", color="error", visible=False)
+        for button in (self.note_send_button, self.note_all_button, self.note_stop_button):
+            button.focusable = False  # 마우스용: 눌러도 메모 편집 자리를 뺏지 않는다
+        self.note_wait_combo = ComboBox(
+            [tr("note.wait.prompt"), tr("note.wait.delay")],
+            index=0 if self.config.note_wait == "prompt" else 1,
+            on_change=lambda index, _text: self._set_note_wait(index),
+        )
+        self.note_delay_combo = EditableComboBox(
+            NOTE_DELAYS, str(self.config.note_delay_ms), validator=_baud_text_ok, min_size=(6, 1),
+            on_change=self._note_delay_typed,
+        )
+        self.note_delay_combo.chosen.connect(lambda _text: self.app.set_focus(self.note_area))
+        # 아래 줄: 넓으면 한 줄(버튼 + 옵션), 좁으면 옵션을 둘째 줄로 내린다.
+        # 위젯을 옮겨 다니면 부모가 꼬이므로, 두 벌을 만들어 두고 보이기만 바꾼다
+        self.note_buttons = HBox(self.note_send_button, self.note_all_button, self.note_stop_button, Spacer(), spacing=1)
+        self.note_options = HBox(
+            Spacer(), self.note_wait_combo, self.note_delay_combo, Label("ms", fg="dim"), spacing=1
+        )
+        self.note_footer = HBox(self.note_buttons, self.note_options, spacing=1)
+        self.note_second_row = HBox(Spacer(), spacing=1)
+        self.note_page = VBox(self.note_area, self.note_footer, stretch=1, visible=False)
+        self._note_queue: list[int] = []
+        self._note_timer = None
+        self._note_waiting_until = 0.0
+        self._note_save_timer = None
+        # 탭 줄에 무엇을 둘지: 둘은 따로 켜고 끈다 (HEX 를 꺼도 메모 탭은 남는다)
+        self.show_hex = self.config.hex
+        self.show_memo = self.config.memo
+        self.right_tabs = TabBar(
+            self._tab_titles(),
+            selected=min(self.config.right_tab, max(0, len(self._tab_kinds()) - 1)),
+            on_select=self._select_right_tab,
+            on_add=self.add_note,
+            on_menu=self.open_note_menu,
+            show_add=self.show_memo,  # HEX 만 켜져 있으면 더할 탭이 없다
+        )
+        self.right_frame = GroupBox(
+            "", VBox(self.right_tabs, self.hex_page, self.note_page), stretch=1, visible=bool(self._tab_kinds())
+        )
+        kinds = self._tab_kinds()
+        if kinds:
+            # TabBar 는 만들 때 선택 신호를 내지 않는다: 저장된 탭 내용을 직접 올린다
+            kind, note_index = kinds[min(self.right_tabs.selected, len(kinds) - 1)]
+            self.hex_page.visible = kind == "hex"
+            self.note_page.visible = kind == "note"
+            if kind == "note":
+                self.note_area.set_text(self.notes[note_index].text, emit=False)
+        # 터미널과 HEX 를 좌우로 나눈다 (경계를 끌어 폭 조절, 비율 저장)
+        self.terminal_split = HSplit(
+            self.frame,
+            self.right_frame,
+            ratio=self.config.hex_split,
+            default_ratio=Settings().hex_split,
+            min_left=20,
+            min_right=30,  # 오프셋 + 4바이트 + ASCII 칸이 들어가는 최소 폭
+            on_change=self._on_hex_split_changed,
+        )
+        self._plot_lines = LineCleaner()
+        # 한 세션의 그래프 형식 (>name:value 또는 Arduino). 처음 받은 줄로 정하고 지우기로 푼다:
+        # 시작 직후 잘린 ">temp:34" 가 "p:34" 로 와도 새 시리즈를 만들지 않게
+        self._plot_format: str | None = None
+        self.plot_filter = PlotLineFilter(accept=self._plot_line_ok, expected_format=lambda: self._plot_format)
+        self.plot_hide_lines = self.config.plot_hide_lines
+        self._plot_series: dict[str, Any] = {}
+        self.plot_clock: Callable[[], float] = time.monotonic
+        self._plot_t0 = self.plot_clock()
 
-        def close_my_dialog():
-            if self.active_dialog:
-                if self.active_dialog in self.root_layout.children:
-                    self.root_layout.children.remove(self.active_dialog)
-                self.active_dialog = None
-                if hasattr(self.root_layout, 'invalidate'):
-                    self.root_layout.invalidate()
+        self.st_led = Label("○", bold=True)
+        # 포트/속도는 누르면 바로 위에 목록이 열린다. 8N1 은 설정 항목이 여러 개라 포트 설정 창을 연다
+        self._status_popup: ListPopup | None = None
+        self.st_port = Label("", on_click=self.open_port_menu)
+        self.st_baud = Label("", fg="dim", on_click=self.open_baud_menu)
+        self.st_framing = Label("", fg="dim", on_click=self.open_port_dialog)
+        self.st_txrx = Label("TX· RX·")
+        self.st_rate = Label("", fg="dim", min_size=(9, 1))
+        # 켜진 모드가 없으면 칸과 앞 구분선을 함께 숨긴다 (빈 칸 뒤에 │ 만 남지 않게)
+        self.st_flags = Label("", fg="accent", visible=False)
+        self.st_flags_sep = Label("│", fg="dim", visible=False)
+        self.st_hint = Label(tr("status.hint"), fg="dim", align="right")
 
-        self.root_layout.children.append(self.active_dialog)
-        if hasattr(self.root_layout, 'invalidate'):
-            self.root_layout.invalidate()
+        def sep() -> Label:
+            return Label("│", fg="dim")
 
-    def _connect_to_port(self, target_port, baudrate):
-        self.baudrate = baudrate
-        self.terminal.feed(f"\r\n[System] {target_port} ({self.baudrate}) 연결 시도 중...\r\n")
-        
-        success = self.serial_port.open(target_port, self.baudrate)
-        if success:
-            self.current_port_name = target_port
-            self.status_label.text = f" ● {target_port} │ {self.baudrate} 8N1 │ TX· RX· │ 0B/s "
-            self.terminal.feed(f"\r\n[System] {target_port} 연결 성공!\r\n")
+        status = HBox(
+            self.st_led, self.st_port, sep(), self.st_baud, self.st_framing, sep(), self.st_txrx, sep(), self.st_rate, self.st_flags_sep,
+            self.st_flags, Spacer(), self.st_hint, spacing=1,
+        )
+        # 매크로 막대: 상태줄 바로 위 한 줄. 등록된 칸은 F 키로도 보낸다
+        self.macro_bar = MacroBar(
+            self.config.macros, on_run=self.run_macro, on_edit=self.ask_macro,
+            on_menu=self.open_macro_menu, visible=self.config.macro_bar,
+        )
+        self.menu = self._build_menu()
+        # 터미널과 그래프 사이 경계(두 테두리 줄)를 마우스로 끌어 높이를 나눈다. 더블클릭은 기본 비율로
+        self.split = VSplit(
+            self.terminal_split,
+            self.plot_frame,
+            ratio=self.config.plot_split,
+            default_ratio=Settings().plot_split,
+            min_top=5,
+            min_bottom=8,  # 범례 줄 + 가로축 눈금 줄 + 시간 폭 줄 + 테두리를 빼고도 그래프가 보이게
+            on_change=self._on_split_changed,
+        )
+        self.app.set_root(VBox(self.menu, self.split, self.macro_bar, status))
+        self.app.set_focus(self.terminal)
+        self.app.add_key_filter(self._key_filter)
+        self.app.add_shortcut("Primary+=", lambda: self.zoom(+1))
+        self.app.add_shortcut("Primary+-", lambda: self.zoom(-1))
+        if IS_MAC:
+            # Windows/Linux 의 Ctrl+F 는 장치로 보내는 제어 문자라 Ctrl-A / 만 쓴다
+            self.app.add_shortcut("Primary+F", self.open_search)
+        self.app.set_interval(100, self._update_status)
+
+        self._sync_panel_menu()  # 저장된 패널 상태에 메뉴 체크를 맞춘다 (다시 켰을 때 어긋나지 않게)
+        self.terminal.feed(banner(__version__, self._banner_info()))
+        self._update_status()
+
+    # ---- UI construction -----------------------------------------------
+
+    def _build_menu(self) -> MenuBar:
+        self.item_echo = MenuItem(tr("menu.view.echo"), lambda: self._apply_echo(self.item_echo.checked), key="E", checked=self.local_echo)
+        self.item_ts = MenuItem(tr("menu.view.timestamps"), lambda: self._apply_timestamps(self.item_ts.checked), key="N", checked=self.terminal.show_timestamps)
+        self.item_complete = MenuItem(tr("menu.view.complete"), lambda: self._apply_complete(self.item_complete.checked), key="T", checked=self.completer.enabled)
+        self.item_guard = MenuItem(tr("menu.view.guard"), lambda: self._apply_guard(self.item_guard.checked), key="G", checked=self.guard_controls)
+        self.item_plot = MenuItem(
+            tr("menu.view.plot"), lambda: self._apply_plot(self.item_plot.checked), shortcut="Ctrl-A G", key="P", checked=self.config.plot
+        )
+        # 오른쪽 패널을 HEX / 메모로 나눠서 고른다 (보고 싶은 것을 바로 고르고, 같은 것을 다시 고르면 닫는다)
+        self.item_hex = MenuItem(
+            tr("menu.view.hex"), lambda: self._apply_hex(self.item_hex.checked),
+            shortcut="Ctrl-A H", key="H", checked=self.config.hex,
+        )
+        self.item_memo = MenuItem(
+            tr("menu.view.memo"), lambda: self._apply_memo(self.item_memo.checked),
+            shortcut="Ctrl-A T", key="T", checked=self.config.memo,
+        )
+        # 오른쪽 패널은 2단 메뉴로: 항목이 늘어도 보기 메뉴가 길어지지 않는다
+        self.item_panel = MenuItem(tr("menu.view.panel"), submenu=[self.item_hex, self.item_memo])
+        self.item_plot_hide = MenuItem(
+            tr("menu.view.plot_hide"), lambda: self._apply_plot_hide(self.item_plot_hide.checked), checked=self.plot_hide_lines
+        )
+        self.item_ascii = MenuItem(
+            tr("menu.view.ascii_input"), lambda: self._apply_ascii_input(self.item_ascii.checked),
+            key="I", checked=self.config.ascii_input,
+        )
+        self.item_macro = MenuItem(
+            tr("menu.view.macro"), lambda: self._apply_macro_bar(self.item_macro.checked),
+            shortcut="Ctrl-A M", key="M", checked=self.config.macro_bar,
+        )
+        self.item_control = MenuItem(
+            tr("menu.port.control"), lambda: self._apply_control(self.item_control.checked), key="E", checked=self.config.control
+        )
+        self.item_reconnect = MenuItem(tr("menu.view.reconnect"), lambda: self._apply_reconnect(self.item_reconnect.checked), key="A", checked=self.auto_reconnect)
+        # 체크는 "다음 실행부터 쓸 언어" (고르면 저장만 하고 화면은 다시 켤 때 바뀐다)
+        chosen = self.config.lang or language()
+        self.item_lang_ko = MenuItem(LANGUAGE_NAMES["ko"], lambda: self._choose_language("ko"), checked=chosen == "ko")
+        self.item_lang_en = MenuItem(LANGUAGE_NAMES["en"], lambda: self._choose_language("en"), checked=chosen == "en")
+        # 메모 파일 넣고 빼기는 탭이 아니라 파일 메뉴에 둔다: 메모가 하나도 없으면 탭 메뉴가 없다
+        self.item_note_import = MenuItem(tr("menu.file.note_import"), self.import_notes, key="I")
+        self.item_note_export_all = MenuItem(tr("menu.file.note_export_all"), self.export_all_notes, key="E")
+        self.item_note_files = MenuItem(tr("menu.file.note"), submenu=[self.item_note_import, self.item_note_export_all])
+        return MenuBar(
+            [
+                # 파일을 맨 앞에: 로그 저장·끝은 포트가 아니라 파일 메뉴에 있을 항목이고, 언어 선택도 여기에 둔다
+                Menu(
+                    tr("menu.file"),
+                    [
+                        MenuItem(tr("menu.file.log"), self.toggle_log, shortcut="Ctrl-A L", key="L"),
+                        MenuItem.sep(),
+                        self.item_note_files,
+                        MenuItem.sep(),
+                        self.item_lang_ko,
+                        self.item_lang_en,
+                        MenuItem.sep(),
+                        MenuItem(tr("menu.file.quit"), self.quit, shortcut="Ctrl-A X", key="X"),
+                    ],
+                ),
+                Menu(
+                    tr("menu.port"),
+                    [
+                        MenuItem(tr("menu.port.connect"), self.connect, shortcut="Ctrl-A R", key="R"),
+                        MenuItem(tr("menu.port.disconnect"), self.disconnect, shortcut="Ctrl-A D", key="D"),
+                        MenuItem(tr("menu.port.settings"), self.open_port_dialog, shortcut="Ctrl-A O", key="O"),
+                        MenuItem.sep(),
+                        self.item_control,
+                    ],
+                ),
+                Menu(
+                    tr("menu.edit"),
+                    [
+                        MenuItem(tr("menu.edit.copy"), self.terminal.copy_selection, shortcut=COPY_KEYS),
+                        MenuItem(tr("menu.edit.paste"), self.terminal.paste, shortcut=PASTE_KEYS),
+                        MenuItem(tr("menu.edit.select_all"), self.terminal.select_all, shortcut=SELECT_ALL_KEYS),
+                        MenuItem.sep(),
+                        MenuItem(tr("menu.edit.find"), self.open_search, shortcut="Ctrl-A /", key="F"),
+                    ],
+                ),
+                Menu(
+                    tr("menu.view"),
+                    [
+                        self.item_echo,
+                        self.item_ts,
+                        self.item_complete,
+                        self.item_guard,
+                        self.item_reconnect,
+                        self.item_macro,
+                        self.item_ascii,
+                        MenuItem.sep(),
+                        self.item_plot,
+                        self.item_plot_hide,
+                        self.item_panel,
+                        MenuItem(tr("menu.view.rules"), self.open_rules_dialog),
+                        MenuItem(tr("menu.view.clear"), self.clear, shortcut="Ctrl-A C", key="C"),
+                        MenuItem.sep(),
+                        MenuItem(tr("menu.view.bigger"), lambda: self.zoom(+1), shortcut="Primary+="),
+                        MenuItem(tr("menu.view.smaller"), lambda: self.zoom(-1), shortcut="Primary+-"),
+                    ],
+                ),
+                Menu(
+                    tr("menu.help"),
+                    [
+                        MenuItem(tr("menu.help.keys"), self.show_help, shortcut="Ctrl-A Z", key="Z"),
+                        MenuItem(tr("menu.help.about"), self.show_about),
+                    ],
+                ),
+            ]
+        )
+
+    def _banner_info(self) -> list[str]:
+        if self.settings.port:
+            first = tr("banner.port", port=self.settings.port, serial=self.settings.summary)
         else:
-            self.terminal.feed(f"\r\n[ERROR] {target_port} 연결 실패.\r\n")
+            first = tr("banner.no_port")
+        return [first + " · " + time.strftime("%H:%M:%S"), tr("banner.keys")]
 
-    def action_close_port(self):
-        self.serial_port.close()
-        self.current_port_name = "disconnected"
-        self.status_label.text = " ○ disconnected │ 115200 8N1 │ TX· RX· │ 0B/s "
-        self.terminal.feed("\r\n[System] 포트 연결이 해제되었습니다.\r\n")
+    # ---- actions -------------------------------------------------------
 
-    def action_show_help(self):
-        self.terminal.feed("\r\n[Help] PaceTerm v0.1.0 - Firmware CLI Terminal\r\n")
+    def notice(self, text: str, error: bool = False) -> None:
+        """장치로 보내지 않고 터미널에만 보여주는 안내."""
+        color = "91" if error else "96"
+        lead = "\r\n" if self.terminal.screen.cx else ""
+        self.terminal.feed(f"{lead}\x1b[{color}m[pace-term] {text}\x1b[0m\r\n")
+        if self.log is not None:
+            self._log_call(self.log.note, text)
 
-    def _print_banner(self):
-        logo = [
-            "██████╗  █████╗  ██████╗███████╗",
-            "██╔══██╗██╔══██╗██╔════╝██╔════╝",
-            "██████╔╝███████║██║     █████╗  ",
-            "██╔═══╝ ██╔══██║██║     ██╔══╝  ",
-            "██║     ██║  ██║╚██████╗███████╗",
-            "╚═╝     ╚═╝  ╚═╝ ╚═════╝╚══════╝ -term\r\n"
-        ]
-        for line in logo:
-            self.terminal.feed(line + "\r\n")
-            
-        self.terminal.feed("펌웨어 CLI 시리얼 터미널 · v0.1.0\r\n")
-        self.terminal.feed("STM32 타깃 보드 연결 대기 중...\r\n")
-        self.terminal.feed("포트 설정 메뉴를 클릭하여 통신 포트를 연결하세요.\r\n\n")
-        self.terminal.feed("cli# ")
+    def connect(self) -> None:
+        if not self.settings.port:
+            self.open_port_dialog()
+            return
+        self._stop_reconnect()
+        self._released = False
+        if not self._open_port():
+            # 보드가 아직 안 꽂혔거나 리셋 중이면 기다렸다가 붙는다
+            if self.auto_reconnect:
+                self._start_reconnect()
+            return
+        self.notice(tr("notice.connected", port=self.settings.port, serial=self.settings.summary))
+        self._update_status()
 
-    def run(self):
-        self.app.run()
+    def _open_port(self, quiet: bool = False) -> bool:
+        try:
+            self.port.open(self.settings)
+        except Exception as e:
+            if not quiet:
+                self.notice(tr("notice.open_failed", port=self.settings.port, error=e), error=True)
+            self._update_status()
+            return False
+        self.decoder.reset()
+        self._load_commands()
+        self._save()
+        return True
+
+    # 재연결 시도 주기. USB CDC 장치가 리셋 후 다시 나타나는 데 보통 1초 안팎이 걸린다
+    RECONNECT_INTERVAL_MS = 1000
+
+    def _start_reconnect(self) -> None:
+        if self._reconnect_timer is not None:
+            return
+        self.notice(tr("notice.reconnecting", port=self.settings.port))
+        self._reconnect_timer = self.app.set_interval(self.RECONNECT_INTERVAL_MS, self._try_reconnect)
+        self._update_status()
+
+    def _stop_reconnect(self) -> None:
+        if self._reconnect_timer is not None:
+            self._reconnect_timer.stop()
+            self._reconnect_timer = None
+            self._update_status()
+
+    def _try_reconnect(self) -> None:
+        if self.port.is_open or not self.settings.port or self._released:
+            self._stop_reconnect()
+            return
+        if self._open_port(quiet=True):
+            self._stop_reconnect()
+            self.notice(tr("notice.reconnected", port=self.settings.port, serial=self.settings.summary))
+            self._update_status()
+
+    def disconnect(self) -> None:
+        self._stop_reconnect()
+        if self.port.is_open:
+            self.completer.close()
+            self.port.close()
+            self.notice(tr("notice.disconnected"))
+        self._update_status()
+
+    def send(self, data: bytes, raw: bool = False) -> None:
+        """장치로 보낸다. raw=False 면 프롬프트 줄에서 펌웨어가 줄에 넣어 버리는 제어 문자를 거른다 (outgoing.py)."""
+        if not raw:
+            data = outgoing_bytes(data, at_prompt=at_prompt(self.terminal), guard=self.guard_controls)
+            if not data:
+                return
+        if not self.port.is_open:
+            now = time.monotonic()
+            if now - self._last_not_connected > _NOT_CONNECTED_NOTICE_S:
+                self._last_not_connected = now
+                self.notice(tr("notice.not_connected"), error=True)
+            return
+        self.port.write(data)
+        if self.hex_active:
+            self.hex_view.append(data, "tx")
+        if self.local_echo:
+            self.terminal.feed(data.decode("utf-8", errors="replace").replace("\r", "\r\n"))
+
+    def clear(self) -> None:
+        self.completer.close()
+        self.terminal.clear()
+
+    def _apply_guard(self, on: bool) -> None:
+        self.item_guard.checked = on
+        self.guard_controls = on
+        self._save()
+
+    def _apply_complete(self, on: bool) -> None:
+        self.item_complete.checked = on
+        self.completer.enabled = on
+        self._save()
+        if not on:
+            self.completer.close()
+
+    def zoom(self, delta: int) -> None:
+        self.app.set_font_size(max(8, min(40, self.app.fonts.size + delta)))
+        self._save()
+
+    def quit(self) -> None:
+        self.stop_control()
+        self.stop_log(notify=False)
+        self._stop_reconnect()
+        self._save()
+        self.port.close()
+        self.app.quit()
+
+    # ---- plot ----------------------------------------------------------
+
+    # 시리즈마다 보관하는 샘플 수: 1kHz 로 10초를 받아도 폭 안의 점이 잘리지 않게
+    PLOT_CAPACITY = 16384
+    # 이름이 계속 바뀌는 데이터(카운터를 이름에 넣는 등)가 와도 범례와 색이 끝없이 늘지 않게
+    PLOT_MAX_SERIES = 12
+
+    # ---- 매크로 막대 ----------------------------------------------------
+
+    def _choose_language(self, lang: str) -> None:
+        """화면 언어를 고른다. 메뉴와 라벨은 만들 때 번역되므로 저장만 하고 다음 실행부터 적용한다.
+
+        (바로 바꾸려면 스크롤백·연결·그래프 상태를 옮겨 담아 화면을 다시 만들어야 해서 하지 않았다)
+        """
+        # 체크 항목은 누를 때 먼저 뒤집히므로 둘 다 직접 맞춘다: 이미 고른 쪽을 다시 눌러도 꺼지지 않게
+        self.item_lang_ko.checked = lang == "ko"
+        self.item_lang_en.checked = lang == "en"
+        changed = lang != (self.config.lang or language())
+        self.config.lang = lang
+        self._save()
+        if changed and lang != language():
+            self.notice(tr("notice.lang_next_start", name=LANGUAGE_NAMES[lang]))
+
+    def _apply_ascii_input(self, on: bool) -> None:
+        """터미널 입력을 입력 언어와 무관하게 영문으로 (미국 배열 물리 키 기준). 한글로 쓰다 와도 바로 명령을 친다."""
+        self.item_ascii.checked = on
+        self.terminal.ascii_input = on
+        self.app.refresh_text_input()  # 포커스가 터미널에 그대로 있어도 IME 를 바로 끄고 켠다
+        self._save()
+
+    def _apply_macro_bar(self, on: bool) -> None:
+        self.item_macro.checked = on
+        self.macro_bar.visible = on
+        self._save()
+
+    def run_macro(self, index: int) -> None:
+        """등록된 명령을 줄끝 코드와 함께 보낸다 (터미널에 직접 친 것과 같게)."""
+        if index >= len(self.macro_bar.macros):
+            self.notice(tr("notice.macro_empty", n=index + 1), error=True)
+            return
+        command = split_entry(self.macro_bar.macros[index])[2]
+        self.send(command.encode("utf-8", "replace") + ENTER_CODES[self.settings.enter], raw=True)
+
+    def open_macro_menu(self, index: int, x: int, y: int) -> ListPopup | None:
+        """매크로 칸 오른쪽 클릭: 수정 / 지우기 중에 고른다."""
+        if index >= len(self.macro_bar.macros):
+            self.ask_macro(index)  # [+] 는 지울 것이 없으니 바로 등록 창
+            return None
+        items = [tr("macro.menu.edit"), tr("macro.menu.delete")]
+
+        def chosen(choice: int) -> None:
+            if choice == 0:
+                self.ask_macro(index)
+            else:
+                self._set_macro(index, "")
+
+        popup = ListPopup(items, 0, on_choose=chosen)
+        popup._app = self.app
+        self.app.ensure_layout()
+        # 막대가 화면 맨 아래라 위로 연다 (칸 왼쪽 끝에 맞춰서)
+        self.app.open_popup(popup, x, y - popup.effective_hint().pref_h)
+        return popup
+
+    def ask_macro(self, index: int) -> Dialog:
+        """칸 하나의 키/이름/명령을 고친다 (목록 끝 번호면 새로 더한다). 명령을 비우면 지운다."""
+        macros = self.macro_bar.macros
+        adding = index >= len(macros)
+        key, name, command = (None, "", "") if adding else split_entry(macros[index])
+        keys = free_keys(macros, keep=key)
+        if not keys:
+            self.notice(tr("notice.macro_full", n=MACRO_SLOTS), error=True)
+            keys = [key or 1]
+        key_combo = ComboBox([f"F{k}" for k in keys], max(0, keys.index(key) if key in keys else 0))
+        name_edit = LineEdit(name, min_size=(16, 1))
+        cmd_edit = LineEdit(command, min_size=(28, 1))
+
+        def done(result: int) -> None:
+            if result == 2:  # 삭제
+                self._set_macro(index, "")
+                return
+            if result != 0:
+                return
+            self._set_macro(index, join_entry(keys[key_combo.index], name_edit.text, cmd_edit.text))
+
+        # 라벨 폭을 가장 긴 것에 맞춘다: 언어마다 길이가 달라서(en 은 Command/Name/Key)
+        # 그냥 두면 입력칸 시작 위치가 어긋난다
+        label_keys = ("dialog.macro.command", "dialog.macro.name", "dialog.macro.key")
+        label_w = max(str_width(tr(k)) for k in label_keys)
+
+        def row(label_key: str, widget) -> HBox:
+            return HBox(Label(tr(label_key), min_size=(label_w, 1)), widget, spacing=1)
+
+        dialog = Dialog(
+            tr("dialog.macro.title", n=key or keys[0]),
+            VBox(
+                row("dialog.macro.command", cmd_edit),
+                row("dialog.macro.name", name_edit),
+                row("dialog.macro.key", HBox(key_combo, Spacer(), spacing=0)),
+                spacing=0,
+            ),
+            # 새로 더하는 중이면 지울 것이 없다
+            (tr("button.ok"), tr("button.cancel"))
+            if adding
+            else (tr("button.ok"), tr("button.cancel"), tr("dialog.macro.delete")),
+            on_result=done,
+        )
+        dialog.open(self.app)
+        self.app.set_focus(cmd_edit)
+        cmd_edit.select_all()
+        return dialog
+
+    # F10 은 메뉴바 키라 매크로로 가로채지 않는다 (macros.MENU_KEY: 고를 수도 없다)
+    MACRO_KEYS = (Key.F1, Key.F2, Key.F3, Key.F4, Key.F5, Key.F6, Key.F7, Key.F8, Key.F9, None, Key.F11, Key.F12)
+
+    def _macro_slot(self, key: int) -> int | None:
+        """눌린 키의 F 번호 (F1 -> 1). 매크로로 쓰지 않는 키면 None."""
+        for i, k in enumerate(self.MACRO_KEYS):
+            if k is not None and key == k:
+                return i + 1
+        return None
+
+    def _set_macro(self, index: int, entry: str) -> None:
+        """비우면 그 칸을 뺀다 (남은 매크로의 F 번호는 그대로). 목록 끝 번호면 새로 더한다.
+
+        키가 겹치면 `normalize` 가 남는 번호로 옮긴다 (고르는 목록에서 이미 뺐으니 드문 경우다).
+        """
+        macros = list(self.macro_bar.macros)
+        if not entry:
+            if index < len(macros):
+                del macros[index]
+        elif index < len(macros):
+            macros[index] = entry
+        elif len(macros) < MACRO_SLOTS:
+            macros.append(entry)
+        self.macro_bar.set_macros(macros)
+        self.app.set_focus(self.terminal)
+        self._save()
+
+    def _apply_plot(self, on: bool) -> None:
+        self.item_plot.checked = on
+        self.plot_frame.visible = on
+        self._release_plot_partial()
+        self._plot_lines = LineCleaner()  # 꺼져 있는 동안 받은 반쪽 줄을 이어 붙이지 않게
+        self._save()
+
+    def _plot_line_ok(self, line: str) -> bool:
+        """이 줄을 그래프 값으로 받을지. 세션의 형식을 여기서 정한다."""
+        if parse_line(line) is None:
+            return False
+        fmt = plot_format(line)
+        if fmt == self._plot_format:
+            return True
+        if self._plot_format is None:
+            self._plot_format = fmt
+            return True
+        if fmt == "tele":
+            # Arduino 형식은 평범한 로그와 구별이 안 된다: `temp=42.0 rpm=1200`(sensor),
+            # `History : 3`(status) 같은 줄이 형식을 채 가면 그 뒤 진짜 `>ax:-15` 가 전부 버려졌다.
+            # `>이름:값` 은 우연히 나오지 않으니 이쪽을 믿고 갈아탄다 (잘못 잡힌 시리즈는 버린다)
+            self._reset_plot_series()
+            self._plot_format = fmt
+            return True
+        return False
+
+    def _feed_plot(self, text: str) -> None:
+        self._add_plot_lines([line for line in self._plot_lines.feed(text) if self._plot_line_ok(line)])
+
+    def _add_plot_lines(self, lines: list[str]) -> None:
+        for line in lines:
+            # 한 묶음 안에서 형식이 바뀌었을 수 있다 (로그 줄이 채 간 형식을 진짜 그래프 줄이 되찾은 경우).
+            # 받기로 한 형식이 아닌 앞줄은 여기서 버린다
+            if plot_format(line) != self._plot_format:
+                continue
+            values = parse_line(line)
+            if not values:
+                continue
+            # Teleplot 의 장치 시각은 쓰지 않는다: 형식마다 단위가 달라 받은 시각으로 통일한다
+            now = self.plot_clock() - self._plot_t0
+            for name, value in values:
+                series = self._plot_series.get(name)
+                if series is None:
+                    if len(self._plot_series) >= self.PLOT_MAX_SERIES:
+                        continue
+                    series = self.plot.add_series(name, capacity=self.PLOT_CAPACITY)
+                    self._plot_series[name] = series
+                series.append(value, now)
+
+    def _apply_plot_hide(self, on: bool) -> None:
+        self.item_plot_hide.checked = on
+        self.plot_hide_lines = on
+        self._release_plot_partial()
+        self._save()
+        self._update_status()
+
+    def _release_plot_partial(self, force: bool = True) -> None:
+        """필터가 붙잡고 있던 끝 조각을 터미널로 (숨기기를 끄거나 오래 기다렸을 때)."""
+        text = self.plot_filter.flush(force=force)
+        if text:
+            self.terminal.feed(text)
+
+    def _on_split_changed(self, ratio: float) -> None:
+        self.config.plot_split = round(ratio, 4)
+        self._save()
+
+    # ---- hex view ------------------------------------------------------
+
+    # ---- highlight rules -----------------------------------------------
+
+    def _apply_rules(self) -> None:
+        """사용자 규칙을 기본 규칙 앞에 놓는다 (같은 글자는 먼저 맞는 규칙의 색)."""
+        self.terminal.rules = compile_rules(self.config.rules) + default_rules()
+        self.terminal.invalidate()
+
+    def open_rules_dialog(self) -> Dialog:
+        entries = list(self.config.rules)
+        listing = ListView(min_size=(52, 8))
+        preview = RulePreview()
+
+        def refresh(selected: int = 0) -> None:
+            listing.set_items([entry_label(e) for e in entries], selected=selected)
+            preview.set_rules(compile_rules(entries) + default_rules())
+
+        def edit(index: int) -> None:
+            if not 0 <= index < len(entries):
+                index = len(entries)  # 목록이 비었거나 고른 것이 없으면 새 규칙을 추가한다
+
+            def done(entry: str) -> None:
+                if index < len(entries):
+                    entries[index] = entry
+                else:
+                    entries.append(entry)
+                refresh(min(index, len(entries) - 1))
+
+            self.ask_rule(entries[index] if index < len(entries) else None, done)
+
+        def remove() -> None:
+            if entries and 0 <= listing.selected < len(entries):
+                del entries[listing.selected]
+                refresh(max(0, min(listing.selected, len(entries) - 1)))
+
+        def on_result(index: int) -> None:
+            if index != 0:
+                return
+            self.config.rules = entries
+            self._apply_rules()
+            self._save()
+
+        body = VBox(
+            listing,
+            preview,
+            HBox(
+                Button(tr("dialog.rules.add"), on_click=lambda: edit(len(entries)), style="solid", color="dim"),
+                Button(tr("dialog.rules.edit"), on_click=lambda: edit(listing.selected), style="solid", color="dim"),
+                Button(tr("dialog.rules.delete"), on_click=remove, style="solid", color="dim"),
+                Spacer(),
+                spacing=1,
+            ),
+            spacing=1,
+        )
+        dialog = Dialog(tr("dialog.rules.title"), body, (tr("button.ok"), tr("button.cancel")), on_result=on_result)
+        dialog.listing, dialog.preview, dialog.entries = listing, preview, entries
+        refresh()
+        dialog.open(self.app)
+        return dialog
+
+    def ask_rule(self, entry: str | None, on_done: Callable[[str], None]) -> Dialog:
+        color, bold, pattern = parse_entry(entry or "") or (DEFAULT_COLOR, False, "")
+        names = list(COLORS)
+        pattern_edit = LineEdit(pattern, min_size=(36, 1), on_change=lambda _text: validate())
+        color_combo = ComboBox(names, index=names.index(color), on_change=lambda *_: validate())
+        bold_box = CheckBox(tr("dialog.rule.bold"), checked=bold, on_toggle=lambda *_: validate())
+        error = Label("", fg="error")
+        preview = RulePreview()
+
+        def current() -> str:
+            return format_entry(color_combo.text, bold_box.checked, pattern_edit.text)
+
+        def problem() -> str:
+            if not pattern_edit.text:
+                return tr("dialog.rule.empty")
+            return pattern_error(pattern_edit.text) or ""
+
+        def validate() -> None:
+            trouble = problem()
+            error.set_text(trouble)
+            preview.set_rules(([] if trouble else compile_rules([current()])) + default_rules())
+            dialog.buttons[0].enabled = not trouble
+
+        def done(index: int) -> None:
+            if index == 0 and not problem():
+                on_done(current())
+
+        body = VBox(
+            HBox(Label(tr("dialog.rule.pattern"), min_size=(8, 1)), pattern_edit, spacing=1),
+            HBox(Label("", min_size=(8, 1)), Label(tr("dialog.rule.example"), fg="dim"), Spacer(), spacing=1),
+            HBox(Label(tr("dialog.rule.color"), min_size=(8, 1)), color_combo, bold_box, Spacer(), spacing=1),
+            preview,
+            error,
+            spacing=1,
+        )
+        dialog = Dialog(tr("dialog.rule.title"), body, (tr("button.ok"), tr("button.cancel")), on_result=done)
+        dialog.pattern_edit, dialog.color_combo, dialog.bold_box = pattern_edit, color_combo, bold_box
+        dialog.preview, dialog.error = preview, error
+        validate()
+        dialog.open(self.app)
+        self.app.set_focus(pattern_edit)
+        return dialog
+
+    @property
+    def hex_active(self) -> bool:
+        """오른쪽 패널이 보이고 HEX 탭을 보고 있을 때만 바이트를 모은다."""
+        kind = self.current_kind
+        return self.right_frame.visible and kind is not None and kind[0] == "hex"
+
+    def _sync_panel_menu(self) -> None:
+        self.item_hex.checked = self.show_hex
+        self.item_memo.checked = self.show_memo
+
+    def _tab_kinds(self) -> list[tuple[str, int]]:
+        """탭 줄에 놓을 것들: ("hex", -1) 과 ("note", 메모 번호)."""
+        kinds: list[tuple[str, int]] = [("hex", -1)] if self.show_hex else []
+        if self.show_memo:
+            kinds += [("note", i) for i in range(len(self.notes))]
+        return kinds
+
+    def _tab_titles(self) -> list[str]:
+        return [tr("hex.title") if kind == "hex" else self.notes[i].title for kind, i in self._tab_kinds()]
+
+    @property
+    def current_kind(self) -> tuple[str, int] | None:
+        kinds = self._tab_kinds()
+        index = self.right_tabs.selected
+        return kinds[index] if 0 <= index < len(kinds) else None
+
+    NOTE_ONE_ROW_MIN = 62  # 버튼 둘 + 대기 방식(17) + 간격 칸 + ms 가 눌리지 않고 들어가는 폭
+
+    def _fit_note_footer(self) -> None:
+        """넓으면 버튼과 옵션을 한 줄에, 좁으면 옵션을 둘째 줄로."""
+        width = self.note_page.rect.w
+        if width <= 0:
+            return
+        two_rows = width < self.NOTE_ONE_ROW_MIN
+        in_second_row = self.note_options.parent is self.note_second_row
+        if two_rows == in_second_row:
+            return
+        self.note_options.parent.remove(self.note_options)
+        if two_rows:
+            self.note_second_row.add(self.note_options)
+            if self.note_second_row.parent is None:
+                self.note_page.add(self.note_second_row)
+        else:
+            self.note_footer.add(self.note_options)
+            if self.note_second_row.parent is not None:
+                self.note_page.remove(self.note_second_row)
+        self.note_page.relayout()
+
+    def _select_right_tab(self, index: int) -> None:
+        kinds = self._tab_kinds()
+        kind = kinds[index] if 0 <= index < len(kinds) else None
+        self.hex_page.visible = kind is not None and kind[0] == "hex"
+        self.note_page.visible = kind is not None and kind[0] == "note"
+        if kind is not None and kind[0] == "note":
+            self.note_area.set_text(self.notes[kind[1]].text, emit=False)
+        self.config.right_tab = index
+        self._sync_panel_menu()
+        self._save()
+        self._update_status()
+
+    # ---- memo tabs ------------------------------------------------------
+
+    @property
+    def current_note(self) -> Note | None:
+        kind = self.current_kind
+        return self.notes[kind[1]] if kind is not None and kind[0] == "note" else None
+
+    def _note_edited(self) -> None:
+        note = self.current_note
+        if note is None:
+            return
+        note.text = self.note_area.text
+        if self._note_save_timer is not None:
+            self._note_save_timer.stop()
+        # 글자를 칠 때마다 파일에 쓰지 않는다: 잠시 멈추면 저장
+        self._note_save_timer = self.app.set_timeout(1000, self._save_notes)
+
+    def _save_notes(self) -> None:
+        self._note_save_timer = None
+        if self.notes_path is None:
+            return
+        try:
+            notes_store.save(self.notes, self.notes_path)
+        except OSError as e:
+            self.notice(tr("notice.notes_save_failed", error=e), error=True)
+
+    def _refresh_tabs(self, keep: tuple[str, int] | None = None) -> None:
+        """탭 줄을 다시 만든다. keep 을 주면 그 탭을, 없으면 보던 탭을 이어서 고른다."""
+        kinds = self._tab_kinds()
+        want = keep or self.current_kind
+        index = kinds.index(want) if want in kinds else min(self.right_tabs.selected, len(kinds) - 1)
+        self.right_tabs.show_add = self.show_memo  # HEX 만 켜져 있으면 더할 탭이 없다
+        self.right_tabs.set_titles(self._tab_titles(), max(0, index))
+        self.right_frame.visible = bool(kinds)
+        self._select_right_tab(self.right_tabs.selected)
+        self._sync_panel_menu()
+
+    def add_note(self) -> Dialog | None:
+        if len(self.notes) >= MAX_NOTES:
+            self.notice(tr("notice.notes_full", n=MAX_NOTES), error=True)
+            return None
+
+        def done(title: str) -> None:
+            self.notes.append(Note(notes_store.unique_title(title, [n.title for n in self.notes])))
+            self.show_memo = True  # 메모를 만들면 메모 탭을 켠다
+            self.config.memo = True
+            self._refresh_tabs(("note", len(self.notes) - 1))
+            self._save()
+            self._save_notes()
+            self.app.set_focus(self.note_area)
+
+        return self.ask_note_title("", done)
+
+    def ask_note_title(self, title: str, on_done: Callable[[str], None]) -> Dialog:
+        edit = LineEdit(title, min_size=(24, 1))
+
+        def done(index: int) -> None:
+            if index == 0 and edit.text.strip():
+                on_done(edit.text)
+
+        dialog = Dialog(
+            tr("dialog.note.title"),
+            HBox(Label(tr("dialog.note.name"), min_size=(6, 1)), edit, spacing=1),
+            (tr("button.ok"), tr("button.cancel")),
+            on_result=done,
+        )
+        dialog.edit = edit
+        dialog.open(self.app)
+        self.app.set_focus(edit)
+        edit.select_all()
+        return dialog
+
+    def open_note_menu(self, index: int, x: int, y: int) -> ListPopup | None:
+        """탭 오른쪽 클릭: 그 탭에 대한 것만 (이름 바꾸기 / 내보내기 / 삭제)."""
+        kinds = self._tab_kinds()
+        kind = kinds[index] if 0 <= index < len(kinds) else None
+        note_index = kind[1] if kind is not None and kind[0] == "note" else -1
+        if not 0 <= note_index < len(self.notes):
+            return None  # HEX 탭: 메모 메뉴가 없다
+        items = [tr("note.menu.rename"), tr("note.menu.export"), tr("note.menu.delete")]
+
+        def chosen(choice: int) -> None:
+            action = items[choice]
+            if action == tr("note.menu.rename"):
+                self.ask_note_title(self.notes[note_index].title, lambda title: self._rename_note(note_index, title))
+            elif action == tr("note.menu.export"):
+                self.export_note(note_index)
+            else:
+                self.delete_note(note_index)
+
+        popup = ListPopup(items, 0, on_choose=chosen)
+        popup._app = self.app
+        hint = popup.effective_hint()
+        self.app.open_popup(popup, x, max(0, min(y + 1, self.app.rows - hint.pref_h)))
+        return popup
+
+    # ---- sending memo lines ---------------------------------------------
+
+    def _set_note_wait(self, index: int) -> None:
+        self.config.note_wait = "prompt" if index == 0 else "delay"
+        self._save()
+
+    def _note_delay_typed(self, text: str) -> None:
+        value = _parse_baud(text)
+        if value is not None and value <= 60000:
+            self.config.note_delay_ms = value
+            self._save()
+
+    def send_note_line(self) -> None:
+        """커서가 있는 줄을 보내고 다음 줄로 내려간다."""
+        if self.current_note is None:
+            return
+        row = self.note_area.row
+        self._send_note_rows([row])
+        self.note_area.move_to(min(row + 1, self.note_area.line_count - 1), 0)
+
+    def send_note_block(self) -> None:
+        """선택한 줄들, 선택이 없으면 전체."""
+        if self.current_note is None:
+            return
+        span = self.note_area.selected_rows()
+        rows = range(span[0], span[1] + 1) if span else range(self.note_area.line_count)
+        self._send_note_rows(list(rows))
+
+    def _send_note_rows(self, rows: list[int]) -> None:
+        self.stop_note_send(quiet=True)
+        self._note_queue = rows
+        if len(rows) > 1:
+            self.note_all_button.visible = False
+            self.note_stop_button.visible = True
+        self._note_step()
+
+    def stop_note_send(self, quiet: bool = False) -> None:
+        if self._note_timer is not None:
+            self._note_timer.stop()
+            self._note_timer = None
+        had_queue = bool(self._note_queue)
+        self._note_queue = []
+        self.note_area.marked_row = None
+        self.note_all_button.visible = True
+        self.note_stop_button.visible = False
+        if had_queue and not quiet:
+            self.notice(tr("notice.note_send_stopped"))
+        self.note_area.invalidate()
+
+    def _note_step(self) -> None:
+        self._note_timer = None
+        if not self._note_queue:
+            self.stop_note_send(quiet=True)
+            return
+        row = self._note_queue.pop(0)
+        line = self.note_area.line(row).strip()
+        self.note_area.marked_row = row
+        self.note_area.invalidate()
+        wait_ms = self.config.note_delay_ms
+        if line.startswith(NOTE_WAIT_PREFIX):
+            # "#wait 2000": 이 줄에서 기다린다 (리셋 뒤 부팅을 기다릴 때)
+            wait_ms = _parse_baud(line[len(NOTE_WAIT_PREFIX) :]) or wait_ms
+        elif not line or line.startswith("#"):
+            self._note_after(0)  # 빈 줄과 주석은 건너뛴다
+            return
+        else:
+            self.send(line.encode("utf-8", "replace") + ENTER_CODES[self.settings.enter], raw=True)
+            if self.config.note_wait == "prompt" and self._note_queue:
+                self._note_waiting_until = time.monotonic() + NOTE_PROMPT_TIMEOUT_S
+                self._note_timer = self.app.set_interval(50, self._note_wait_prompt)
+                return
+        self._note_after(wait_ms if self._note_queue else 0)
+
+    def _note_wait_prompt(self) -> None:
+        """프롬프트가 다시 나오면 다음 줄로. 안 나오면 정해진 시간 뒤에 넘어간다."""
+        if at_prompt(self.terminal):
+            self._note_after(0)
+        elif time.monotonic() >= self._note_waiting_until:
+            self.notice(tr("notice.note_wait_timeout"), error=True)
+            self._note_after(0)
+
+    def _note_after(self, delay_ms: int) -> None:
+        if self._note_timer is not None:
+            self._note_timer.stop()
+        if not self._note_queue:
+            self.stop_note_send(quiet=True)
+            return
+        self._note_timer = self.app.set_timeout(max(1, delay_ms), self._note_step)
+
+    def _rename_note(self, index: int, title: str) -> None:
+        others = [n.title for i, n in enumerate(self.notes) if i != index]
+        self.notes[index].title = notes_store.unique_title(title, others)
+        self._refresh_tabs(("note", index))
+        self._save_notes()
+
+    def delete_note(self, index: int) -> None:
+        if not 0 <= index < len(self.notes):
+            return
+        del self.notes[index]
+        self._refresh_tabs(("note", min(index, len(self.notes) - 1)) if self.notes else None)
+        self._save_notes()
+
+    def export_note(self, index: int) -> FileDialog | None:
+        if not 0 <= index < len(self.notes):
+            return None
+        note = self.notes[index]
+        folder = Path(self.config.log_dir) if self.config.log_dir else default_log_dir()
+
+        suffixes = [".txt", ".json"]
+        combo = ComboBox([tr("dialog.note.format_txt"), tr("dialog.note.format_json")])
+
+        def pick_format(index: int, _text: str) -> None:
+            # 형식을 정하는 것은 파일 이름의 확장자다. 콤보는 그 확장자를 바꿔 주는 손잡이일 뿐이다.
+            # 목록에서 고르면 칸에 경로가 통째로 들어오므로 stem 만 쓰면 폴더를 잃는다
+            try:
+                name = str(Path(dialog.name_edit.text.strip() or note.title).with_suffix(suffixes[index]))
+            except ValueError:  # "." 처럼 이름이라 할 수 없는 글자
+                return
+            dialog.name_edit.set_text(name)
+
+        combo.changed.connect(pick_format)
+
+        def done(path: Path | None) -> None:
+            if path is None:
+                return
+            try:
+                if path.suffix.lower() == ".json":
+                    notes_store.export_all([note], path)  # 제목까지 남는다
+                else:
+                    notes_store.export_text(note, path)
+            except OSError as e:
+                self.notice(tr("notice.notes_save_failed", error=e), error=True)
+                return
+            self.notice(tr("notice.note_exported", path=path))
+
+        dialog = FileDialog(
+            tr("dialog.note.export"),
+            mode="save",
+            directory=folder,
+            filename=f"{note.title}.txt",
+            confirm_existing=tr("dialog.log.exists"),
+            text=file_dialog_text(),
+            extra=VBox(
+                HBox(Label(tr("dialog.note.format"), min_size=(4, 1)), combo, Spacer(), spacing=1),
+                HBox(Label("", min_size=(4, 1)), Label(tr("dialog.note.export_hint"), fg="dim"), Spacer(), spacing=1),
+            ),
+            on_result=done,
+        )
+        dialog.format_combo = combo
+        dialog.open(self.app)
+        return dialog
+
+    def export_all_notes(self) -> FileDialog | None:
+        """메모 전체를 .json 하나로. 가져오기가 그대로 되돌린다 (다른 PC 로 옮길 때)."""
+        if not self.notes:
+            self.notice(tr("notice.notes_empty"), error=True)
+            return None
+        folder = Path(self.config.log_dir) if self.config.log_dir else default_log_dir()
+
+        def done(path: Path | None) -> None:
+            if path is None:
+                return
+            if path.suffix.lower() != ".json":
+                path = path.with_suffix(".json")  # 전체 내보내기는 형식이 하나뿐이다
+            try:
+                notes_store.export_all(self.notes, path)
+            except OSError as e:
+                self.notice(tr("notice.notes_save_failed", error=e), error=True)
+                return
+            self.notice(tr("notice.notes_exported", count=len(self.notes), path=path))
+
+        dialog = FileDialog(
+            tr("dialog.note.export_all"),
+            mode="save",
+            directory=folder,
+            filename="baram-memos.json",
+            confirm_existing=tr("dialog.log.exists"),
+            text=file_dialog_text(),
+            extra=HBox(
+                Label("", min_size=(4, 1)),
+                Label(tr("dialog.note.export_all_hint", n=len(self.notes)), fg="dim"),
+                Spacer(),
+                spacing=1,
+            ),
+            on_result=done,
+        )
+        dialog.open(self.app)
+        return dialog
+
+    def import_notes(self) -> FileDialog:
+        folder = Path(self.config.log_dir) if self.config.log_dir else default_log_dir()
+
+        def done(path: Path | None) -> None:
+            if path is None:
+                return
+            try:
+                found = notes_store.import_file(path)
+            except OSError as e:
+                self.notice(tr("notice.notes_load_failed", error=e), error=True)
+                return
+            room = MAX_NOTES - len(self.notes)
+            if room <= 0:
+                self.notice(tr("notice.notes_full", n=MAX_NOTES), error=True)
+                return
+            for note in found[:room]:
+                note.title = notes_store.unique_title(note.title, [n.title for n in self.notes])
+                self.notes.append(note)
+            self.show_memo = True
+            self.config.memo = True
+            self._refresh_tabs(("note", len(self.notes) - 1))
+            self._save()
+            self._save_notes()
+            self.notice(tr("notice.notes_imported", count=min(len(found), room)))
+
+        dialog = FileDialog(
+            tr("dialog.note.import"),
+            mode="open",
+            directory=folder,
+            text=file_dialog_text(),
+            on_result=done,
+        )
+        dialog.open(self.app)
+        return dialog
+
+    def _apply_hex(self, on: bool) -> None:
+        """HEX 탭을 탭 줄에 둘지. 끄면 HEX 탭만 사라지고 메모 탭은 남는다."""
+        self.show_hex = on
+        self.config.hex = on
+        if not on:
+            self.hex_view.clear()  # 꺼 둔 동안의 바이트는 모으지 않으므로 오프셋이 이어지지 않는다
+        self._refresh_tabs(("hex", -1) if on else None)
+        self._save()
+
+    def _apply_memo(self, on: bool) -> None:
+        self.show_memo = on
+        self.config.memo = on
+        if on and not self.notes:
+            self.add_note()  # 메모가 없으면 하나 만든다
+            return
+        self._refresh_tabs(("note", 0) if on and self.notes else None)
+        self._save()
+        if not on:
+            self.hex_view.clear()  # 꺼 두는 동안 받은 바이트는 모으지 않으므로 오프셋이 이어지지 않는다
+        self._save()
+        self._update_status()
+
+    def _on_hex_split_changed(self, ratio: float) -> None:
+        self.app.ensure_layout()
+        self._on_hex_selection()  # 폭이 바뀌면 설명을 다시 맞춘다
+        self.config.hex_split = round(ratio, 4)
+        self._save()
+
+    def toggle_hex_pause(self) -> None:
+        paused = not self.hex_view.paused
+        self.hex_view.set_paused(paused)
+        self.hex_run_button.set_text(tr("hex.start") if paused else tr("hex.stop"))
+        self.hex_run_button.set_color("ok" if paused else "error")
+        self.app.set_focus(self.terminal)
+
+    def _on_hex_selection(self) -> None:
+        data = self.hex_view.selected_bytes()
+        start = self.hex_view.selection[0] if self.hex_view.selection else 0
+        self.hex_info.set_text(describe(start, data, self.hex_info.rect.w or None))
+        self.hex_copy_button.enabled = bool(data)
+
+    def copy_hex_selection(self) -> None:
+        data = self.hex_view.selected_bytes()
+        if data:
+            clipboard_put(as_hex(data))
+            self.notice(tr("notice.hex_copied", count=len(data)))
+        self.app.set_focus(self.terminal)
+
+    def clear_hex(self) -> None:
+        self.hex_view.clear()
+        self.app.set_focus(self.terminal)
+
+    def toggle_plot_pause(self) -> None:
+        paused = not self.plot.paused
+        self.plot.set_paused(paused)
+        self.plot_run_button.set_text(tr("plot.start") if paused else tr("plot.stop"))
+        self.plot_run_button.set_color("ok" if paused else "error")
+        self.app.set_focus(self.terminal)  # 버튼을 눌러도 입력은 터미널로
+
+    def _reset_plot_series(self) -> None:
+        self.plot.clear_series()
+        self._plot_series.clear()
+
+    def clear_plot(self) -> None:
+        self._reset_plot_series()
+        self._plot_format = None
+        self._plot_t0 = self.plot_clock()
+        self.app.set_focus(self.terminal)
+
+    def set_plot_window(self, seconds: float) -> None:
+        self.plot.window = seconds
+        self.plot.invalidate_pixels()
+        self.config.plot_window = seconds
+        # 메뉴 대화상자로 바꿨을 때 아래 칸도 맞춘다 (칸에서 입력 중인 "2." 같은 글자는 건드리지 않게 값으로 비교)
+        if _parse_seconds(self.plot_window_combo.text) != seconds:
+            self.plot_window_combo.set_text(_format_seconds(seconds), emit=False)
+        self._save()
+
+    def _plot_window_typed(self, text: str) -> None:
+        seconds = _parse_seconds(text)
+        if seconds is not None and seconds != self.plot.window:
+            self.set_plot_window(seconds)
+
+    def _plot_window_submitted(self, text: str) -> None:
+        if _parse_seconds(text) is None:
+            self.notice(tr("notice.bad_plot_window", text=text), error=True)
+            self.plot_window_combo.set_text(_format_seconds(self.plot.window), emit=False)
+        self.app.set_focus(self.terminal)
+
+    def open_search(self) -> None:
+        if self.search is not None and self.search.is_open:
+            self.app.set_focus(self.search.edit)
+            self.search.edit.select_all()
+            return
+        self.completer.close()
+        self.search = SearchBar(self)
+        self.search.open()
+
+    # ---- log file ------------------------------------------------------
+
+    def toggle_log(self) -> None:
+        if self.log is not None:
+            self.stop_log()
+        else:
+            self.open_log_dialog()
+
+    def open_log_dialog(self) -> FileDialog:
+        if self.config.log_dir:
+            folder = Path(self.config.log_dir)
+        else:
+            folder = default_log_dir()
+            try:
+                folder.mkdir(parents=True, exist_ok=True)  # 처음 한 번: 문서 폴더 아래 baram-term 폴더
+            except OSError:
+                pass
+        timestamps_box = CheckBox(tr("dialog.log.timestamps"), checked=self.config.log_timestamps)
+
+        def on_result(path: Path | None) -> None:
+            if path is not None:
+                self.start_log(str(path), timestamps_box.checked)
+
+        dialog = FileDialog(
+            tr("dialog.log.title"),
+            mode="save",
+            directory=folder,
+            filename=log_filename(self.settings.port),
+            extra=timestamps_box,
+            confirm_existing=tr("dialog.log.exists"),
+            text={"save": tr("button.start")},  # 로그는 저장이 아니라 기록 시작
+            on_result=on_result,
+        )
+        dialog.timestamps_box = timestamps_box
+        dialog.open(self.app)
+        return dialog
+
+    def start_log(self, path: str, timestamps: bool) -> bool:
+        path = path.strip()
+        if not path:
+            return False
+        file = Path(path).expanduser()
+        s = self.settings
+        header = f"--- pace-term {__version__} · {s.port or '-'} {s.summary} · {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.stop_log(notify=False)
+        try:
+            log = SessionLog(file, timestamps=timestamps, header=header)
+        except OSError as e:
+            self.notice(tr("notice.log_open_failed", error=e), error=True)
+            return False
+        self.config.log_dir = str(file.parent)
+        self.config.log_timestamps = timestamps
+        self._save()
+        self.log = log
+        self.notice(tr("notice.log_started", path=file))
+        self._update_status()
+        return True
+
+    def stop_log(self, notify: bool = True) -> None:
+        log, self.log = self.log, None
+        if log is None:
+            return
+        try:
+            log.close()
+        except (OSError, ValueError):
+            pass
+        if notify:
+            self.notice(tr("notice.log_stopped", path=log.path, lines=log.lines))
+            self._update_status()
+
+    def _log_call(self, write: Callable[[str], None], text: str) -> None:
+        try:
+            write(text)
+        except (OSError, ValueError) as e:
+            # 디스크가 차거나 USB 저장장치가 빠지면 기록을 멈추고 알린다 (터미널은 계속 동작)
+            log, self.log = self.log, None
+            if log is not None:
+                try:
+                    log.close()
+                except (OSError, ValueError):
+                    pass
+            self.notice(tr("notice.log_failed", error=e), error=True)
+            self._update_status()
+
+    def _apply_echo(self, on: bool) -> None:
+        self.local_echo = on
+        self.item_echo.checked = on
+        self._save()
+        self.notice(tr("notice.echo", state=tr("state.on" if on else "state.off")))
+        self._update_status()
+
+    def _apply_timestamps(self, on: bool) -> None:
+        self.item_ts.checked = on
+        self.terminal.set_show_timestamps(on)
+        self._save()
+        self.notice(tr("notice.timestamps", state=tr("state.on" if on else "state.off")))
+        self._update_status()
+
+    def _apply_line_codes(self) -> None:
+        s = self.settings
+        self.terminal.enter = ENTER_CODES.get(s.enter, b"\r")
+        self.terminal.backspace = BACKSPACE_CODES.get(s.backspace, b"\x08")
+        self.terminal.screen.lf_implies_cr = s.rx_lf != "lf"
+
+    # ---- external control (control.py) -----------------------------------
+
+    UI_CALL_TIMEOUT_S = 5.0
+
+    def start_control(self) -> bool:
+        if self.control is None:
+            self.control = ControlServer(
+                self.rx_history,
+                self._ctl_ui,
+                self._run_on_ui,
+                on_change=lambda: self.app.call_soon(self._update_status),
+                describe_port=lambda path: None if path.startswith(DEMO_PORT) else usb_info(path),
+            )
+        try:
+            self.control.start()
+        except OSError as e:
+            self.notice(tr("notice.control_failed", error=e), error=True)
+            return False
+        return True
+
+    def stop_control(self) -> None:
+        if self.control is not None:
+            self.control.stop()
+        self._update_status()
+
+    def _apply_control(self, on: bool) -> None:
+        self.item_control.checked = on
+        if on:
+            if self.start_control():
+                self.notice(tr("notice.control_on", address=self.control.address))
+        else:
+            self.stop_control()
+            self.notice(tr("notice.control_off"))
+        self._save()
+        self._update_status()
+
+    def _run_on_ui(self, fn: Callable[[], Any]) -> Any:
+        """제어 연결 스레드에서 부른다: fn 을 UI 스레드에서 돌리고 결과(또는 예외)를 넘겨받는다."""
+        done = threading.Event()
+        box: dict[str, Any] = {}
+
+        def call() -> None:
+            try:
+                box["value"] = fn()
+            except BaseException as e:  # noqa: BLE001 - 연결 스레드로 넘겨 거기서 올린다
+                box["error"] = e
+            finally:
+                done.set()
+
+        self.app.call_soon(call)
+        if not done.wait(self.UI_CALL_TIMEOUT_S):
+            raise TimeoutError
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    def _ctl_ui(self, cmd: str, req: dict[str, Any]) -> dict[str, Any]:
+        """외부 제어 요청 중 앱 상태를 만지는 것 (UI 스레드)."""
+        s = self.settings
+        if cmd == "send":
+            if not self.port.is_open:
+                raise CtlError("released" if self._released else "not_connected", s.port or "no port selected")
+            eol = req.get("eol") or s.enter
+            data = req["text"].encode("utf-8", "replace") + (b"" if eol == "none" else ENTER_CODES[eol])
+            mark = self.rx_history.end  # 보내기 직전: 이 뒤에 받은 것이 이 명령의 응답이다
+            self.send(data, raw=True)
+            self._update_status()
+            return {"mark": mark, "sent": data.decode("utf-8", "replace")}
+        if cmd == "release":
+            if self.port.is_open:
+                self._stop_reconnect()
+                self.completer.close()
+                self.port.close()
+                self._released = True
+                self.notice(tr("notice.control_released", port=s.port))
+            elif self._reconnect_timer is not None:
+                self._stop_reconnect()  # 재연결 대기 중이었다면 그것도 멈춘다: 다른 도구가 열 수 있게
+                self._released = True
+            self._update_status()
+        elif cmd == "resume":
+            if not self.port.is_open:
+                if not s.port:
+                    raise CtlError("no_port", "no port selected in pace-term")
+                try:
+                    self.port.open(s)
+                except Exception as e:
+                    raise CtlError("open_failed", f"{s.port}: {e}") from e
+                self.decoder.reset()
+                self._released = False
+                self.notice(tr("notice.control_resumed", port=s.port, serial=s.summary))
+            self._update_status()
+        elif cmd != "status":
+            raise CtlError("bad_request", cmd)
+        return {
+            "port": s.port,
+            "baud": s.baud,
+            "framing": s.framing,
+            "enter": s.enter,
+            "connected": self.port.is_open,
+            "released": self._released,
+            "reconnecting": self._reconnect_timer is not None,
+            "control": self.control is not None and self.control.running,
+            "clients": self.control.clients if self.control is not None else 0,
+            "title": self._window_title(),
+            "version": __version__,
+        }
+
+    def _apply_reconnect(self, on: bool) -> None:
+        self.item_reconnect.checked = on
+        self.auto_reconnect = on
+        if not on:
+            self._stop_reconnect()
+        self._save()
+
+    def _save(self) -> None:
+        c = self.config
+        s = self.settings
+        # demo:// 는 마지막 포트로 남기지 않는다: --demo 한 번 뒤 다음 실행이 demo 에 붙으면 헷갈린다
+        if s.port and s.port != DEMO_PORT:
+            c.port, c.baud, c.bytesize, c.parity, c.stopbits, c.flow = (
+                s.port, s.baud, s.bytesize, s.parity, float(s.stopbits), s.flow
+            )
+        c.enter, c.backspace, c.rx_lf = s.enter, s.backspace, s.rx_lf
+        c.plot = self.plot_frame.visible
+        c.hex = self.show_hex
+        c.memo = self.show_memo
+        c.right_tab = self.right_tabs.selected
+        c.plot_hide_lines = self.plot_hide_lines
+        c.local_echo = self.local_echo
+        c.timestamps = self.terminal.show_timestamps
+        c.completion = self.completer.enabled
+        c.guard_controls = self.guard_controls
+        c.auto_reconnect = self.auto_reconnect
+        c.control = self.item_control.checked
+        c.macro_bar = self.macro_bar.visible
+        c.ascii_input = self.terminal.ascii_input
+        c.macros = list(self.macro_bar.macros)
+        c.font_size = self.app.fonts.size
+        c.cols, c.rows = self.app.cols, self.app.rows
+        if self.config_path is None:
+            return
+        try:
+            config_store.save(c, self.config_path)
+        except OSError as e:
+            if not self._save_error_shown:
+                self._save_error_shown = True
+                self.notice(tr("notice.settings_save_failed", error=e), error=True)
+
+    def _load_commands(self) -> None:
+        commands = self.config.commands.get(self.settings.port)
+        if commands:
+            self.completer.catalog.commands = list(commands)
+
+    def _on_commands_learned(self, commands: list[str]) -> None:
+        if self.settings.port:
+            self.config.commands[self.settings.port] = list(commands)
+            self._save()
+
+    # ---- status bar quick switch ---------------------------------------
+
+    def open_port_menu(self) -> ListPopup | None:
+        return self._open_status_popup(self.st_port, self._port_choices(), self.settings.port, self.switch_port)
+
+    def open_baud_menu(self) -> ListPopup | None:
+        current = str(self.settings.baud)
+        rates = sorted({*BAUD_RATES, *self.config.recent_bauds, current}, key=int)
+        items = [*rates, tr("status.custom_baud")]
+
+        def choose(item: str) -> None:
+            if item in rates:
+                self.switch_baud(int(item))
+            else:
+                self.ask_custom_baud()
+
+        return self._open_status_popup(self.st_baud, items, current, choose)
+
+    def _open_status_popup(
+        self, anchor: Label, items: list[str], current: str, choose: Callable[[str], None]
+    ) -> ListPopup | None:
+        popup = self._status_popup
+        if popup is not None and popup.is_open:
+            popup.close()
+            self._status_popup = None
+            if popup.owner is anchor:
+                return None  # 같은 글자를 다시 누르면 닫기만
+        app = self.app
+        app.ensure_layout()
+        popup = ListPopup(items, items.index(current) if current in items else 0, on_choose=lambda i: choose(items[i]), visible_rows=12)
+        popup.owner = anchor
+        popup._app = app
+        hint = popup.effective_hint()
+        # 목록 글자가 상태줄 글자와 같은 열에서 시작하게 (상자 테두리 + 여백 2칸), 상태줄 바로 위에
+        app.open_popup(popup, anchor.rect.x - 2, anchor.rect.y - hint.pref_h)
+        self._status_popup = popup
+        return popup
+
+    def switch_port(self, port: str) -> None:
+        if port == self.settings.port and self.port.is_open:
+            return
+        self._remember_port(port)
+        self.settings = replace(self.settings, port=port)
+        self._stop_reconnect()
+        self.completer.close()
+        self.port.close()
+        self._save()
+        self.connect()
+
+    def switch_baud(self, baud: int) -> None:
+        if baud <= 0 or baud == self.settings.baud:
+            return
+        self.settings = replace(self.settings, baud=baud)
+        self._remember_baud(baud)
+        if self.port.is_open:
+            try:
+                self.port.set_baud(baud)
+            except Exception:
+                self.port.close()  # 열린 채 속도를 바꾸지 못하는 장치: 새 속도로 다시 연다
+                self.connect()
+            else:
+                self.notice(tr("notice.baud_changed", port=self.settings.port, serial=self.settings.summary))
+        self._save()
+        self._update_status()
+
+    def ask_custom_baud(self) -> Dialog:
+        """상태줄 속도 메뉴의 '직접 입력...': 받은 값을 바로 적용한다."""
+        return self.ask_baud_value(self.settings.baud, self.switch_baud)
+
+    def ask_baud_value(self, current: int, on_done: Callable[[int], None]) -> Dialog:
+        """속도를 직접 받아 on_done 에 넘긴다. 적용 여부는 부르는 쪽이 정한다.
+
+        포트 설정 대화상자는 OK 를 눌러야 반영되는 구조다. 여기서 곧바로 switch_baud 를
+        부르면 취소를 눌러도 속도가 이미 바뀌어 있어서, '묻기' 와 '적용' 을 나눠 둔다.
+        """
+        edit = LineEdit(str(current), validator=_baud_text_ok, min_size=(12, 1))
+
+        def done(index: int) -> None:
+            if index != 0:
+                return
+            baud = _parse_baud(edit.text)
+            if baud is None:
+                self.notice(tr("notice.bad_baud", text=edit.text), error=True)
+                return
+            on_done(baud)
+
+        dialog = Dialog(
+            tr("dialog.baud.title"),
+            HBox(Label(tr("dialog.port.baud")), edit, spacing=1),
+            (tr("button.ok"), tr("button.cancel")),
+            on_result=done,
+        )
+        dialog.edit = edit
+        dialog.open(self.app)
+        self.app.set_focus(edit)
+        edit.select_all()
+        return dialog
+
+    RECENT_PORTS_MAX = 8
+    RECENT_BAUDS_MAX = 8
+
+    def _port_choices(self) -> list[str]:
+        """고를 수 있는 것만: 지금 꽂혀 있는 포트, 스캔으로 못 찾는 최근 주소, demo 순.
+
+        뽑아 둔 장치는 넣지 않는다. 골라 봐야 반드시 연결에 실패하고, 전에는 연결 중이던
+        포트와 최근 포트를 무조건 끼워 넣어서 **장치를 뽑고 새로고침해도 목록이 그대로였다**
+        (버튼이 안 눌린 것처럼 보이던 원인). 연결돼 있는 포트는 어차피 탐지되므로 따로
+        앞세울 필요가 없다.
+
+        다만 `socket://` `rfc2217://` 처럼 스캔에 잡히지 않는 주소는 남긴다. 그런 주소는
+        최근 목록이 유일한 재사용 수단이라, 지우면 매번 손으로 다시 쳐야 한다.
+        """
+        detected = list_ports()
+        remembered = [p for p in self.config.recent_ports if "://" in p]
+        choices: list[str] = []
+        for port in (*detected, *remembered, DEMO_PORT):
+            if port and port not in choices:
+                choices.append(port)
+        return choices
+
+    def _remember_port(self, port: str) -> None:
+        if not port or port == DEMO_PORT:
+            return
+        recent = [p for p in self.config.recent_ports if p != port]
+        self.config.recent_ports = [port, *recent][: self.RECENT_PORTS_MAX]
+
+    def _remember_baud(self, baud: int) -> None:
+        """직접 입력한 속도를 기억한다. 표준 속도는 늘 목록에 있으니 기억하지 않는다."""
+        text = str(baud)
+        if baud <= 0 or text in BAUD_RATES:
+            return
+        recent = [b for b in self.config.recent_bauds if b != text]
+        self.config.recent_bauds = [text, *recent][: self.RECENT_BAUDS_MAX]
+
+    def open_port_dialog(self) -> Dialog:
+        ports = self._port_choices()
+        current = self.settings.port
+
+        def combo(items, value) -> ComboBox:
+            items = list(items)
+            return ComboBox(items, index=items.index(value) if value in items else 0)
+
+        s = self.settings
+        stop = str(int(s.stopbits)) if float(s.stopbits).is_integer() else str(s.stopbits)
+        port_cb = combo(ports, current)
+        # 목록에서 고르면 주소 칸에 채우고, 확인은 주소 칸 값으로 연결한다 (socket://, rfc2217:// 직접 입력)
+        # padding=1: 위아래 줄이 모두 ComboBox 라 한 칸 들여 그린다. 이 칸만 붙어 보이면 어긋나 보인다
+        address = LineEdit(current or port_cb.text, placeholder="socket://host:port", min_size=(32, 1), padding=1)
+        port_cb.changed.connect(lambda _index, text: address.set_text(text))
+
+        def sync_combo() -> None:
+            """목록과 주소 칸이 늘 같은 것을 가리키게 한다.
+
+            설정된 포트가 뽑혀 있으면 목록에 없다. 그때 주소만 남겨 두면 목록은 다른 포트를
+            가리켜 화면이 서로 다른 말을 하고, 목록을 비우면 고장난 것처럼 보인다. 그래서
+            찾은 포트 중 첫 번째로 옮기고 주소도 거기에 맞춘다. 어차피 없는 포트로는 연결이
+            안 되고, 취소하면 기존 설정은 그대로 남는다.
+            """
+            if port_cb.set_text(address.text.strip(), emit=False):
+                return
+            port_cb.set_index(0, emit=False)
+            address.set_text(port_cb.text)
+
+        def refresh() -> None:
+            port_cb.set_items(self._port_choices())
+            sync_combo()
+
+        sync_combo()
+
+        # 박스 버튼은 3줄이라 한 줄짜리로: 포트 줄 높이를 늘리지 않는다
+        refresh_button = Button(tr("dialog.port.refresh"), on_click=refresh, style="fill")
+        refresh_button.focusable = False  # 마우스로만 쓴다. 눌렀을 때 ►◄ 포커스 표시가 뜨지 않게
+        # 목록 밖 속도(250000 등)는 맨 아래 '직접 입력...' 으로 받는다. 상태줄 속도 메뉴와 같은
+        # 창을 띄우고, 받은 값은 목록 끝에 넣어 고른 상태로 만든다. 콤보박스를 편집까지 되게
+        # 하면 "고르는 것인지 쓰는 것인지" 가 헷갈려서 고르는 쪽으로만 둔다.
+        custom_baud = tr("status.custom_baud")
+        # 저장해 둔 커스텀 속도도 목록에 넣는다. 없으면 combo() 가 첫 항목(9600)으로 떨어뜨린다.
+        # 끝에 붙이지 않고 숫자 순으로 끼우는 것은 상태줄 속도 메뉴와 같은 방식이다
+        rates = sorted({*BAUD_RATES, *self.config.recent_bauds, str(s.baud)}, key=int)
+        baud_cb = ComboBox(
+            [*rates, custom_baud],
+            index=rates.index(str(s.baud)),
+            visible_rows=len(rates) + 1,  # 안내 항목이 스크롤해야 보이면 넣으나 마나다
+        )
+        last_baud_index = [baud_cb.index]
+
+        def use_baud(baud: int) -> None:
+            kept = [i for i in baud_cb.items if i != custom_baud]
+            items = sorted({*kept, str(baud)}, key=int)
+            baud_cb.set_items([*items, custom_baud], keep_text=False)
+            baud_cb.visible_rows = len(items) + 1
+            baud_cb.set_text(str(baud), emit=False)
+            last_baud_index[0] = baud_cb.index
+
+        def baud_picked(index: int, text: str) -> None:
+            if text != custom_baud:
+                last_baud_index[0] = index
+                return
+            # 먼저 고르기 전 값으로 되돌려 둔다: 창을 취소해도 안내 문구가 골라진 채 남지 않는다
+            baud_cb.set_index(last_baud_index[0], emit=False)
+            self.ask_baud_value(_parse_baud(baud_cb.text) or s.baud, use_baud)
+
+        baud_cb.changed.connect(baud_picked)
+        bits_cb = combo(BYTESIZES, str(s.bytesize))
+        parity_cb = combo(PARITIES, s.parity)
+        stop_cb = combo(STOPBITS, stop)
+        flow_cb = combo(FLOWS, s.flow)
+        enter_keys, backspace_keys = tuple(ENTER_CODES), tuple(BACKSPACE_CODES)
+        enter_cb = ComboBox([k.upper() for k in enter_keys], index=enter_keys.index(s.enter) if s.enter in enter_keys else 0)
+        backspace_cb = ComboBox(
+            ["BS (0x08)", "DEL (0x7F)"], index=backspace_keys.index(s.backspace) if s.backspace in backspace_keys else 0
+        )
+        rx_lf_cb = ComboBox(
+            [tr("dialog.port.rx_lf.crlf"), tr("dialog.port.rx_lf.lf")],
+            index=RX_LF_MODES.index(s.rx_lf) if s.rx_lf in RX_LF_MODES else 0,
+        )
+
+        def row(label_key: str, widget) -> HBox:
+            return HBox(Label(tr(label_key), min_size=(12, 1)), widget, Spacer(), spacing=1)
+
+        body = VBox(
+            HBox(Label(tr("dialog.port.port"), min_size=(12, 1)), port_cb, refresh_button, Spacer(), spacing=1),
+            HBox(Label(tr("dialog.port.address"), min_size=(12, 1)), address, spacing=1),
+            row("dialog.port.baud", baud_cb),
+            row("dialog.port.bytesize", bits_cb),
+            row("dialog.port.parity", parity_cb),
+            row("dialog.port.stopbits", stop_cb),
+            row("dialog.port.flow", flow_cb),
+            row("dialog.port.enter", enter_cb),
+            row("dialog.port.backspace", backspace_cb),
+            row("dialog.port.rx_lf", rx_lf_cb),
+        )
+
+        def on_result(index: int) -> None:
+            if index != 0:
+                return
+            baud = _parse_baud(baud_cb.text)
+            if baud is None:
+                self.notice(tr("notice.bad_baud", text=baud_cb.text), error=True)
+                return
+            port = address.text.strip()
+            self._remember_port(port)
+            self._remember_baud(baud)
+            self.settings = PortSettings(
+                port=port,
+                baud=baud,
+                bytesize=int(bits_cb.text),
+                parity=parity_cb.text,
+                stopbits=float(stop_cb.text),
+                flow=flow_cb.text,
+                enter=enter_keys[enter_cb.index],
+                backspace=backspace_keys[backspace_cb.index],
+                rx_lf=RX_LF_MODES[rx_lf_cb.index],
+            )
+            self._apply_line_codes()
+            self._save()
+            self.connect()
+
+        dialog = Dialog(tr("dialog.port.title"), body, (tr("button.ok"), tr("button.cancel")), on_result=on_result)
+        dialog.port_combo, dialog.address, dialog.refresh_button = port_cb, address, refresh_button
+        dialog.enter_combo, dialog.backspace_combo, dialog.rx_lf_combo = enter_cb, backspace_cb, rx_lf_cb
+        dialog.baud_combo = baud_cb
+        dialog.open(self.app)
+        return dialog
+
+    def show_help(self) -> None:
+        copy = COPY_KEYS.replace("Primary", "Cmd")
+        paste = PASTE_KEYS.replace("Primary", "Cmd")
+        message_box(self.app, tr("help.title"), tr("help.body", copy=copy, paste=paste), (tr("button.close"),))
+
+    def show_about(self) -> Dialog:
+        link = Link(REPO_URL)
+        body = VBox(*[Label(line) for line in tr("about.body", version=__version__).split("\n")], Label(""), link)
+        dialog = Dialog(tr("about.title"), body, (tr("button.close"),))
+        dialog.link = link
+        dialog.open(self.app)
+        # 링크가 첫 포커스면 Enter 가 창을 닫지 않고 브라우저를 연다: 닫기 버튼에서 시작
+        self.app.set_focus(dialog.buttons[0])
+        return dialog
+
+    # ---- events --------------------------------------------------------
+
+    def _key_filter(self, ev: KeyEvent) -> bool:
+        name = ev.name.lower()
+        if self._prefix:
+            if any(m in name for m in ("shift", "ctrl", "alt", "meta", "gui")) and len(name) > 1:
+                return True  # 수정자 키만 누른 것은 명령으로 보지 않는다
+            self._prefix = False
+            self._update_status()
+            if ev.key == Key.ESCAPE:
+                return True
+            if ev.mod & Mod.CTRL and name == "a":
+                self.send(b"\x01", raw=True)  # 사용자가 명시적으로 보내는 제어 문자는 거르지 않는다
+                return True
+            action = {
+                "o": self.open_port_dialog,
+                "p": self.open_port_dialog,
+                "r": self.connect,
+                "d": self.disconnect,
+                "e": lambda: self._apply_echo(not self.local_echo),
+                "n": lambda: self._apply_timestamps(not self.terminal.show_timestamps),
+                "c": self.clear,
+                "x": self.quit,
+                "q": self.quit,
+                "z": self.show_help,
+                "l": self.toggle_log,
+                "/": self.open_search,
+                "g": lambda: self._apply_plot(not self.plot_frame.visible),
+                "h": lambda: self._apply_hex(not self.show_hex),
+                "t": lambda: self._apply_memo(not self.show_memo),
+                "m": lambda: self._apply_macro_bar(not self.macro_bar.visible),
+                "f": self.open_search,
+            }.get(name)
+            if action is not None:
+                action()
+            return True
+        if ev.mod & Mod.CTRL and not ev.mod & (Mod.META | Mod.ALT) and name == "a":
+            self._prefix = True
+            self._update_status()
+            return True
+        if self.macro_bar.visible and not ev.mod:
+            fkey = self._macro_slot(ev.key)
+            index = None if fkey is None else self.macro_bar.index_of_key(fkey)
+            if index is not None:
+                self.run_macro(index)
+                return True
+        if self.search is not None and self.search.is_open:
+            return False  # 찾기 칸에 입력 중: Tab 자동완성을 끼우지 않는다
+        return self.completer.handle_key(ev)
+
+    def _on_rx(self) -> None:
+        data = self.port.take()
+        if data:
+            if self.hex_active:
+                self.hex_view.append(data, "rx")  # 디코딩 전 바이트 그대로
+            text = self.decoder.decode(data)
+            self.rx_history.feed(text)
+            if self.plot_frame.visible and self.plot_hide_lines:
+                shown, plot_lines = self.plot_filter.feed(text)
+                if shown:
+                    self.terminal.feed(shown)
+                self._add_plot_lines(plot_lines)
+            else:
+                self.terminal.feed(text)
+                if self.plot_frame.visible:
+                    self._feed_plot(text)
+            if self.log is not None:
+                self._log_call(self.log.feed, text)  # 로그에는 그래프 줄까지 받은 그대로
+            self.completer.on_text(text)
+
+    def _on_port_error(self, message: str) -> None:
+        self.completer.close()
+        self.port.close()
+        self.notice(tr("notice.port_error", error=message), error=True)
+        if self.auto_reconnect:
+            self._start_reconnect()
+        self._update_status()
+
+    def _window_title(self) -> str:
+        """창 제목에 포트를 넣는다: 창을 여러 개 띄웠을 때 (그리고 ctl list 에서) 구별되게."""
+        return f"pace-term - {self.settings.port}" if self.settings.port else "pace-term"
+
+    def _update_status(self) -> None:
+        now = time.monotonic()
+        window = getattr(self.app, "window", None)
+        if window is not None and window.title != self._window_title():
+            window.title = self._window_title()
+        p = self.port
+        connected = p.is_open
+        self.st_led.set_text("●" if connected else "○")
+        led_fg = "ok" if connected else "error"
+        if self.st_led.fg != led_fg:
+            self.st_led.fg = led_fg
+            self.st_led.invalidate()
+        self.st_port.set_text(self.settings.port or tr("status.no_port"))
+        self.st_baud.set_text(str(self.settings.baud))
+        self.st_framing.set_text(self.settings.framing)
+        tx = "●" if now - p.last_tx < _LED_HOLD_S else "·"
+        rx = "●" if now - p.last_rx < _LED_HOLD_S else "·"
+        self.st_txrx.set_text(f"TX{tx} RX{rx}")
+        t0, rx0, _ = self._rate_prev
+        if now - t0 >= 1.0:
+            self._rx_rate = (p.rx_bytes - rx0) / (now - t0)
+            self._rate_prev = (now, p.rx_bytes, p.tx_bytes)
+        self.st_rate.set_text(_human_rate(self._rx_rate))
+        flags = []
+        if self._prefix:
+            flags.append(tr("status.prefix"))
+        if self.local_echo:
+            flags.append("ECHO")
+        if self.terminal.show_timestamps:
+            flags.append("TS")
+        if getattr(self, "log", None) is not None:
+            flags.append("LOG")
+        if self.plot_frame.visible and self.plot_hide_lines:
+            flags.append("PLOT")  # 그래프 줄이 터미널에서 빠지고 있다는 표시
+            self._release_plot_partial(force=False)
+        if self.hex_active:
+            flags.append("HEX")
+        if getattr(self, "_reconnect_timer", None) is not None:
+            flags.append(tr("status.reconnecting"))
+        if getattr(self, "_released", False):
+            flags.append(tr("status.released"))
+        control = getattr(self, "control", None)
+        if control is not None and control.active:
+            flags.append("CTL")  # 외부 도구가 붙어 있다 (보낸 명령과 응답은 터미널에 그대로 보인다)
+        self.st_flags.set_text(" ".join(flags))
+        self.st_flags.visible = self.st_flags_sep.visible = bool(flags)
+        if getattr(self, "note_page", None) is not None and self.note_page.visible:
+            self._fit_note_footer()
+        if self.hex_active and self.hex_view.selection is not None:
+            self._on_hex_selection()  # 폭이 바뀌면 설명을 그 폭에 다시 맞춘다
+        if getattr(self, "note_all_button", None) is not None and self.note_page.visible:
+            picked = self.note_area.selected_rows() is not None
+            label = tr("note.send_selection") if picked else tr("note.send_all")
+            if self.note_all_button.text != label:
+                self.note_all_button.set_text(label)
+        search = getattr(self, "search", None)
+        if search is not None and search.is_open:
+            search.tick()
+
+    def run(self) -> None:
+        if self.config.control:
+            self.start_control()
+        if self.settings.port:
+            self.connect()
+        try:
+            self.app.run()
+        finally:
+            self.stop_control()
+            self.stop_log(notify=False)
+            self.port.close()
