@@ -54,7 +54,7 @@ def make_icon(size: int = 512) -> pygame.Surface:
     return surf
 
 
-# 릴리스 빌드(tools/baram-term.spec)가 실행 파일 아이콘을 만들 때 쓴다. 실행 중에는 위의
+# 릴리스 빌드(tools/pace-term.spec)가 실행 파일 아이콘을 만들 때 쓴다. 실행 중에는 위의
 # Surface 를 창에 붙이지만, 꺼져 있는 앱의 Dock/탐색기 아이콘은 파일에 박힌 것을 보여 준다.
 # 둘 다 PNG 를 그대로 담을 수 있는 형식이라 iconutil 이나 Pillow 없이 어느 OS 에서든 만든다.
 

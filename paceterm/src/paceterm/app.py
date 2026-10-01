@@ -403,7 +403,7 @@ class PaceTermApp:
             shortcut="Ctrl-A M", key="M", checked=self.config.macro_bar,
         )
         self.item_control = MenuItem(
-            tr("menu.port.control"), lambda: self._apply_control(self.item_control.checked), key="E", checked=self.config.control
+            # tr("menu.port.control"), lambda: self._apply_control(self.item_control.checked), key="E", checked=self.config.control
         )
         self.item_reconnect = MenuItem(tr("menu.view.reconnect"), lambda: self._apply_reconnect(self.item_reconnect.checked), key="A", checked=self.auto_reconnect)
         # 체크는 "다음 실행부터 쓸 언어" (고르면 저장만 하고 화면은 다시 켤 때 바뀐다)
@@ -437,7 +437,7 @@ class PaceTermApp:
                         MenuItem(tr("menu.port.disconnect"), self.disconnect, shortcut="Ctrl-A D", key="D"),
                         MenuItem(tr("menu.port.settings"), self.open_port_dialog, shortcut="Ctrl-A O", key="O"),
                         MenuItem.sep(),
-                        self.item_control,
+                        # self.item_control,
                     ],
                 ),
                 Menu(
